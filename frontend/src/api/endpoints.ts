@@ -318,6 +318,22 @@ export function remixMaterials(
   })
 }
 
+/* ================= 分镜 ================= */
+
+export interface StoryboardShot {
+  text: string
+  term: string
+}
+
+export function makeStoryboard(body: {
+  video_subject: string
+  video_script: string
+  video_language?: string
+  max_shots?: number
+}): Promise<{ shots: StoryboardShot[] }> {
+  return post('/api/v1/storyboard', body)
+}
+
 /* ================= 声音克隆 ================= */
 
 export function cloneVoice(

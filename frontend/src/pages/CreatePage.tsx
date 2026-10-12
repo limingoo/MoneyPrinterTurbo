@@ -39,6 +39,7 @@ import {
   uploadBgm,
   checkMaterials,
   remixMaterials,
+  makeStoryboard,
   type ClonedVoiceEntry,
   type MaterialCheckResult,
 } from '../api/endpoints'
@@ -288,60 +289,95 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
       return
     }
 
-    // 素材库来源：提交前自动按关键词匹配库内素材；
-    // 没有关键词时把库里所有可用素材按量混合拼接。
+    // 素材来源：分镜对齐 / 关键词匹配 / 全库混剪
     let formToSubmit: CreateForm = form
-    if (form.video_source === 'local' && form.local_materials.length === 0) {
-      const terms = parseTermList()
+    if (form.video_source === 'local') {
       setSubmitting(true)
       try {
-        const result = terms.length ? await checkMaterials(terms) : null
-        const files = new Set<string>()
-        if (result) {
-          for (const matched of Object.values(result.matched)) {
-            matched.forEach((f) => files.add(f))
+        if (form.storyboard_align) {
+          // ===== 分镜对齐：LLM 拆分镜 → 逐镜头匹配库内标签 → 顺序排列 =====
+          const shotsResponse = await makeStoryboard({
+            video_subject: form.video_subject.trim(),
+            video_script: form.video_script.trim(),
+            video_language: form.video_language,
+          })
+          const terms = [...new Set(shotsResponse.shots.map((s) => s.term))]
+          const match = terms.length ? await checkMaterials(terms) : null
+          const pool: Record<string, string[]> = match?.matched ?? {}
+          if (Object.keys(pool).length === 0) {
+            toast(
+              'error',
+              '素材库里没有匹配任何分镜的素材。请到「素材库」页补充，或关闭分镜对齐改用网络来源。',
+            )
+            setSubmitting(false)
+            return
+          }
+          const used = new Set<string>()
+          const ordered: { name: string; file: string; size: number }[] = []
+          for (const shot of shotsResponse.shots) {
+            const candidates = pool[shot.term] ?? []
+            let chosen = candidates.find((f) => !used.has(f))
+            if (!chosen) {
+              // 镜头多于素材时循环复用（保留重复镜头以铺满时长）
+              chosen = candidates[0]
+            }
+            if (chosen) {
+              ordered.push({ name: chosen, file: chosen, size: 0 })
+              used.add(chosen)
+            }
+          }
+          formToSubmit = {
+            ...form,
+            local_materials: ordered,
+            video_concat_mode: 'sequential',
+          }
+        } else {
+          // ===== 普通模式：关键词匹配（或全库混剪） =====
+          const terms = parseTermList()
+          const result = terms.length ? await checkMaterials(terms) : null
+          const files = new Set<string>()
+          if (result) {
+            for (const matched of Object.values(result.matched)) {
+              matched.forEach((f) => files.add(f))
+            }
+          }
+          if (files.size === 0) {
+            toast(
+              'error',
+              terms.length
+                ? '素材库里没有与关键词匹配的素材。请到「素材库」页补充，或更换素材来源。'
+                : '素材库里还没有素材。请先到「素材库」页上传，或更换素材来源。',
+            )
+            setSubmitting(false)
+            return
+          }
+          formToSubmit = {
+            ...form,
+            local_materials: [...files].slice(0, 12).map((file) => ({
+              name: file,
+              file,
+              size: 0,
+            })),
           }
         }
-        if (files.size === 0) {
-          toast(
-            'error',
-            terms.length
-              ? '素材库里没有与关键词匹配的素材。请到「素材库」页补充，或更换素材来源。'
-              : '素材库里还没有素材。请先到「素材库」页上传，或更换素材来源。',
-          )
-          setSubmitting(false)
-          return
-        }
-        formToSubmit = {
-          ...form,
-          local_materials: [...files].slice(0, 12).map((file) => ({
-            name: file,
-            file,
-            size: 0,
-          })),
-        }
       } catch (e) {
-        toast('error', e instanceof Error ? e.message : '素材匹配失败')
+        toast(
+          'error',
+          e instanceof Error ? e.message : '素材准备失败，请重试或更换素材来源',
+        )
         setSubmitting(false)
         return
       }
     }
 
-    setSubmitting(true)
-    try {
-      if (customAudio) {
-        await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)
-        toast('success', '任务已提交（使用自定义配音），正在生成…')
-      } else {
-        await createVideo(toParams(formToSubmit))
-        toast('success', '任务已提交，正在生成…')
-      }
-      onCreated()
-    } catch (e) {
-      toast('error', e instanceof Error ? e.message : '提交失败')
-    } finally {
-      setSubmitting(false)
+    if (customAudio) {
+      await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)
+      toast('success', '任务已提交（使用自定义配音），正在生成…')
+    } else {
+      await createVideo(toParams(formToSubmit))
+      toast('success', '任务已提交，正在生成…')
     }
+    onCreated()
   }
 
   const CONFIG_TABS: { key: ConfigTab; label: string; icon: React.ReactElement }[] = [
@@ -516,6 +552,18 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                         )}
                       </p>
                     )}
+                  </Row>
+                  <Row label="分镜对齐">
+                    <div className="flex items-center gap-3">
+                      <Switch
+                        checked={form.storyboard_align}
+                        onChange={(v) => patch({ storyboard_align: v })}
+                      />
+                      <span className="text-[11px] leading-snug text-muted">
+                        开启后按文案顺序逐句配画面
+                        {form.video_source === 'local' ? '（LLM 拆分镜 + 库内标签匹配）' : '（逐句匹配素材顺序）'}
+                      </span>
+                    </div>
                   </Row>
                   <Row label="画面比例">
                     <Segmented

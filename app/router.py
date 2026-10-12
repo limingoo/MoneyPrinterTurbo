@@ -15,6 +15,7 @@ from app.controllers.v1 import (
     custom_audio,
     llm,
     material_library,
+    storyboard,
     video,
     voice_clone,
 )
@@ -33,3 +34,5 @@ root_api_router.include_router(config_api.router)
 root_api_router.include_router(voice_clone.router)
 # 新增的独立模块：素材库（智能入库/打标/预检/变体）
 root_api_router.include_router(material_library.router)
+# 新增的独立模块：分镜拆分（文案 → 分镜表）
+root_api_router.include_router(storyboard.router)

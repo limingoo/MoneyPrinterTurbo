@@ -44,6 +44,7 @@ export interface CreateForm {
   bgm_volume: number
   // 高级
   n_threads: number
+  storyboard_align: boolean
 }
 
 export const FONT_OPTIONS = [
@@ -127,6 +128,7 @@ export const defaultForm: CreateForm = {
   bgm_file: '',
   bgm_volume: 0.2,
   n_threads: 2,
+  storyboard_align: false,
 }
 
 const STORAGE_KEY = 'mpt.create_form'
@@ -167,11 +169,12 @@ export function toParams(form: CreateForm): VideoParams {
     video_script: form.video_script.trim(),
     video_terms: terms.length ? terms : null,
     video_aspect: form.video_aspect,
-    video_concat_mode: form.video_concat_mode,
+    video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
     video_transition_mode:
       form.video_transition === 'none'
         ? null
         : (form.video_transition as VideoParams['video_transition_mode']),
+    match_materials_to_script: form.storyboard_align,
     video_clip_duration: form.video_clip_duration,
     video_clip_speed: form.video_clip_speed,
     video_count: form.video_count,
@@ -199,7 +202,7 @@ export function toParams(form: CreateForm): VideoParams {
     paragraph_number: form.paragraph_number,
     video_script_prompt: form.video_script_prompt,
     custom_system_prompt: form.custom_system_prompt,
-    match_materials_to_script: form.match_materials_to_script,
+    // 分镜对齐开关已覆盖上面的 match_materials_to_script，这里不再重复赋值
   }
 
   if (form.video_source === 'local') {
