@@ -3760,3 +3760,11 @@ if __name__ == "__main__":
         loop.run_until_complete(_do())
     finally:
         loop.close()
+
+# ---------------------------------------------------------------------------
+# 运行时 TTS 扩展（svclone 克隆声音→SiliconFlow）。必须在本模块完全载入
+# 后调用：voice_extensions.install() 包装 _single_tts，把 svclone:<id> 的
+# 克隆声音解析回 SiliconFlow URI；其余音色走原分发链不受影响。
+from app.services import voice_extensions as _voice_extensions
+
+_voice_extensions.install()

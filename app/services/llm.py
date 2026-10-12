@@ -1242,3 +1242,12 @@ if __name__ == "__main__":
     )
     print("######################")
     print(search_terms)
+
+
+# ---------------------------------------------------------------------------
+# 运行时 provider 扩展（opencode_go）。必须在本模块完全载入后调用：
+# llm_extensions.install() 会包装 _generate_response，为 OpenCode Go 网关
+# 补充会话头与端点路由；其余 provider 走原实现不受影响。
+from app.services import llm_extensions as _llm_extensions
+
+_llm_extensions.install()
