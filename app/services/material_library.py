@@ -992,7 +992,7 @@ def remix_for_missing_terms(missing_terms: list[str], aspect: str = "9:16") -> d
             else:
                 _remix_from_image(source, out_path, size)
                 transform_label = "kenburns"
-            tags = sorted({*get_all_tags().get(out_name, []), term})
+            tags = sorted({*get_index().get(out_name, {}).get("tags", []), term})
             _upsert(out_name, {
                 "status": "ok",
                 "status_reason": f"由《{source.name}》{transform_label} 衍生",

@@ -84,6 +84,8 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
   const toast = useToast()
   const [form, setForm] = useState<CreateForm>(() => loadForm())
   const [submitting, setSubmitting] = useState(false)
+  // 提交细分阶段（用于按钮下面的进度提示）：storyboard=LLM 拆分镜（慢） match=库内匹配
+  const [submitPhase, setSubmitPhase] = useState<'storyboard' | 'match' | null>(null)
   const [genScript, setGenScript] = useState(false)
   const [genTerms, setGenTerms] = useState(false)
   const [genAudio, setGenAudio] = useState(false)
@@ -281,6 +283,11 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     }
   }
 
+  const stopSubmit = () => {
+    setSubmitPhase(null)
+    setSubmitting(false)
+  }
+
   const handleSubmit = async () => {
     if (!form.video_subject.trim() && !form.video_script.trim()) {
       toast('error', '请填写视频主题或文案')
@@ -299,14 +306,31 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     if (form.video_source === 'local') {
       setSubmitting(true)
       try {
+        // 分镜拆分失败 = 停止提交并明确报错（保持开关语义：要拆分镜就按分镜来，不静默换方式）
+        let alignShots: StoryboardShot[] | null = null
         if (form.storyboard_align) {
-          // ===== 分镜对齐：LLM 拆分镜 → 逐镜头匹配库内标签 → 顺序排列 =====
-          const shotsResponse = await makeStoryboard({
-            video_subject: form.video_subject.trim(),
-            video_script: form.video_script.trim(),
-            video_language: form.video_language,
-          })
-          const terms = [...new Set(shotsResponse.shots.map((s) => s.term))]
+          setSubmitPhase('storyboard')
+          try {
+            alignShots = (
+              await makeStoryboard({
+                video_subject: form.video_subject.trim(),
+                video_script: form.video_script.trim(),
+                video_language: form.video_language,
+              })
+            ).shots
+          } catch {
+            stopSubmit()
+            toast(
+              'error',
+              '分镜拆分失败（LLM 响应超时或配置问题）。已停止提交：请稍后重试，或在「画面」页签关闭分镜对齐后再生成。',
+            )
+            return
+          }
+        }
+        setSubmitPhase('match')
+        if (alignShots) {
+          // ===== 分镜对齐：逐镜头匹配库内标签 → 顺序排列 =====
+          const terms = [...new Set(alignShots.map((s) => s.term))]
           const match = terms.length ? await checkMaterials(terms) : null
           const pool: Record<string, string[]> = match?.matched ?? {}
           if (Object.keys(pool).length === 0) {
@@ -314,13 +338,13 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
               'error',
               '素材库里没有匹配任何分镜的素材。请到「素材库」页补充，或关闭分镜对齐改用网络来源。',
             )
-            setSubmitting(false)
+            stopSubmit()
             return
           }
-          missingShots = shotsResponse.shots.filter((s) => !(pool[s.term]?.length > 0))
+          missingShots = alignShots.filter((s) => !(pool[s.term]?.length > 0))
           const used = new Set<string>()
           const ordered: { name: string; file: string; size: number }[] = []
-          for (const shot of shotsResponse.shots) {
+          for (const shot of alignShots) {
             const candidates = pool[shot.term] ?? []
             let chosen = candidates.find((f) => !used.has(f))
             if (!chosen) {
@@ -354,7 +378,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                 ? '素材库里没有与关键词匹配的素材。请到「素材库」页补充，或更换素材来源。'
                 : '素材库里还没有素材。请先到「素材库」页上传，或更换素材来源。',
             )
-            setSubmitting(false)
+            stopSubmit()
             return
           }
           formToSubmit = {
@@ -371,12 +395,13 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           'error',
           e instanceof Error ? e.message : '素材准备失败，请重试或更换素材来源',
         )
-        setSubmitting(false)
+        stopSubmit()
         return
       }
     }
 
     let taskId: string | undefined
+    setSubmitPhase(null)
     if (customAudio) {
       taskId = (await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)).task_id
       toast('success', '任务已提交（使用自定义配音），正在生成…')
@@ -434,6 +459,15 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           <Send size={16} />
           生成视频
         </Button>
+        {submitting && (
+          <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+            {submitPhase === 'storyboard'
+              ? '正在拆分镜…（免费 LLM 最慢约 2 分钟，请稍候）'
+              : submitPhase === 'match'
+                ? '正在匹配素材库画面…'
+                : '正在提交任务…'}
+          </span>
+        )}
         <Button
           variant="ghost"
           className="h-11 shrink-0 rounded-full px-3 text-xs"
