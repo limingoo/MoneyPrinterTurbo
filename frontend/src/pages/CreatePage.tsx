@@ -328,13 +328,25 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
             matched.forEach(pushFile)
           }
         }
-        if (!result || Object.keys(result.matched).length === 0) {
-          // 标签没命中 ≠ 没素材：库非空就继续出片（全库混剪），
-          // 缺的镜头由后台分镜分析登记到任务卡片
-          const lib = await getMaterialLibrary()
-          lib.files
-            .filter((f) => f.status === 'ok')
-            .forEach((f) => pushFile(f.file))
+        if (files.length === 0) {
+          if (result) {
+            // 有关键词但 0 命中：用无关素材硬拼 = 废片，不出片（秒拦，不再等 LLM）
+            stopSubmit()
+            setSubmitFailure({
+              reason: `素材库没有与关键词匹配的画面（${terms.length} 个关键词 0 段命中）——用无关素材硬拼只会出废片，故不生成`,
+              shots: [],
+            })
+            toast(
+              'error',
+              '关键词没有命中任何素材，本次不生成。到「素材库」补对应画面，或改用网络素材。',
+            )
+            return
+          }
+          if (!terms.length) {
+            // 用户没给关键词（明确的全库混剪意图）：直接取库内全部可用素材
+            const lib = await getMaterialLibrary()
+            lib.files.filter((f) => f.status === 'ok').forEach((f) => pushFile(f.file))
+          }
         }
         if (files.length === 0) {
           // 库彻底为空——没内容可拼，拦截并留下持久提示
@@ -353,9 +365,6 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
             .slice(0, 12)
             .map(({ file }) => ({ name: file, file, size: 0 })),
           video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
-        }
-        if (!result || Object.keys(result.matched).length === 0) {
-          toast('info', '库内标签暂未命中关键词，本次用全部可用素材生成；分镜缺口生成后见任务卡片')
         }
       } catch (e) {
         toast('error', e instanceof Error ? e.message : '素材匹配失败，请重试或更换素材来源')
