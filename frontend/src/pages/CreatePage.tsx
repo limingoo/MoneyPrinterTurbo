@@ -40,8 +40,10 @@ import {
   checkMaterials,
   remixMaterials,
   makeStoryboard,
+  addShootNeeds,
   type ClonedVoiceEntry,
   type MaterialCheckResult,
+  type StoryboardShot,
 } from '../api/endpoints'
 import type { AudioOnlyRequest, FileInfo } from '../api/types'
 import {
@@ -290,6 +292,9 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     }
 
     // 素材来源：分镜对齐 / 关键词匹配 / 全库混剪
+    // 分镜路径中未被库内任何标签命中的镜头 → 登记为拍摄任务（跟着任务走）
+    let missingShots: StoryboardShot[] = []
+
     let formToSubmit: CreateForm = form
     if (form.video_source === 'local') {
       setSubmitting(true)
@@ -312,6 +317,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
             setSubmitting(false)
             return
           }
+          missingShots = shotsResponse.shots.filter((s) => !(pool[s.term]?.length > 0))
           const used = new Set<string>()
           const ordered: { name: string; file: string; size: number }[] = []
           for (const shot of shotsResponse.shots) {
@@ -370,12 +376,33 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
       }
     }
 
+    let taskId: string | undefined
     if (customAudio) {
-      await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)
+      taskId = (await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)).task_id
       toast('success', '任务已提交（使用自定义配音），正在生成…')
     } else {
-      await createVideo(toParams(formToSubmit))
+      taskId = (await createVideo(toParams(formToSubmit))).task_id
       toast('success', '任务已提交，正在生成…')
+    }
+
+    // 缺口镜头登记为拍摄任务清单（任务页卡片可见，素材上传后自动核销）
+    if (missingShots.length > 0 && taskId) {
+      try {
+        const toBrief = (s: StoryboardShot) => ({
+          term: s.term,
+          title: s.title || s.term,
+          brief: s.brief || '',
+        })
+        const added = (await addShootNeeds(taskId, missingShots.map(toBrief))).added
+        if (added > 0) {
+          toast(
+            'info',
+            `有 ${added} 个镜头素材库里没有，已生成拍摄简报 → 到「任务」页查看该片的拍摄清单。本次先用近似画面补位。`,
+          )
+        }
+      } catch {
+        /* 清单登记失败不影响任务 */
+      }
     }
     onCreated()
   }
@@ -505,19 +532,19 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                     {form.video_source === 'local' && (
                       <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                         {checking ? (
-                          '正在按关键词检查你的素材库…'
+                          '正在检查素材库…'
                         ) : checkResult ? (
                           <>
-                            将自动使用库内匹配画面
-                            {checkResult.covered.length > 0 && (
-                              <span className="text-success">
-                                {' '}
-                                （已覆盖：{checkResult.covered.join('、')}）
-                              </span>
-                            )}
+                            可覆盖 {checkResult.covered.length} 项
                             {checkResult.missing.length > 0 && (
                               <span className="text-warn">
-                                ；缺「{checkResult.missing.join('、')}」，
+                                {' '}· 缺 {checkResult.missing.length} 项将自动补位
+                              </span>
+                            )}
+                            ，生成时自动挑选
+                            {checkResult.missing.length > 0 && (
+                              <>
+                                {' ；'}
                                 <button
                                   type="button"
                                   className="text-brand underline decoration-dotted disabled:opacity-50"
@@ -541,11 +568,10 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                                       .finally(() => setRemixing(false))
                                   }}
                                 >
-                                  {remixing ? '衍生中…' : '从近似画面智能补充'}
+                                  {remixing ? '衍生中…' : '先用库内近似画面补齐'}
                                 </button>
-                              </span>
+                              </>
                             )}
-                            。
                           </>
                         ) : (
                           '生成时按关键词自动挑选'

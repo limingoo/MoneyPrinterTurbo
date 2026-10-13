@@ -320,11 +320,6 @@ export function remixMaterials(
 
 /* ================= 分镜 ================= */
 
-export interface StoryboardShot {
-  text: string
-  term: string
-}
-
 export function makeStoryboard(body: {
   video_subject: string
   video_script: string
@@ -332,6 +327,44 @@ export function makeStoryboard(body: {
   max_shots?: number
 }): Promise<{ shots: StoryboardShot[] }> {
   return post('/api/v1/storyboard', body)
+}
+
+/* ================= 拍摄任务清单（视频生成任务的素材缺口） ================= */
+
+export interface StoryboardShot {
+  text: string
+  term: string
+  title?: string
+  brief?: string
+}
+
+export interface ShootNeed {
+  id: string
+  task_id: string
+  term: string
+  title: string
+  brief: string
+  status: 'open' | 'resolved'
+  filename?: string
+  requested_at?: string
+}
+
+/** 登记某生成任务的拍摄缺口（人话简报） */
+export function addShootNeeds(
+  taskId: string,
+  items: { term: string; title: string; brief: string }[],
+): Promise<{ added: number }> {
+  return post('/api/v1/shoot_needs', { task_id: taskId, items })
+}
+
+/** 拉取拍摄需求（不传 task_id 返回全部） */
+export function getShootNeeds(taskId?: string): Promise<{ needs: ShootNeed[] }> {
+  return get(taskId ? `/api/v1/shoot_needs?task_id=${encodeURIComponent(taskId)}` : '/api/v1/shoot_needs')
+}
+
+/** 手动补齐一条需求（素材上传入库也会自动核销） */
+export function resolveShootNeed(id: string, filename = ''): Promise<{ need: ShootNeed }> {
+  return post('/api/v1/shoot_needs/resolve', { id, filename })
 }
 
 /* ================= 声音克隆 ================= */

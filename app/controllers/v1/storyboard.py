@@ -20,6 +20,7 @@ from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.services import llm as llm_service
+from app.services import shoot_needs as shoot_needs_service
 from app.utils import utils
 
 router = new_router(dependencies=[Depends(base.verify_token)])
@@ -38,10 +39,13 @@ def _build_prompt(subject: str, script: str, max_shots: int) -> str:
         "要求：\n"
         f"1. 分镜数量 3~{max_shots} 个，按文案叙述顺序排列；\n"
         "2. 每个分镜的 text 必须是文案中的**原句或原句合并**，不要改写、不要省略、合并后要能覆盖全部文案；\n"
-        "3. 每个分镜的 term 是该句画面的中文关键词（2~6 个字，如：面部按摩、樱花特写），\n"
-        "   要具体到可搜索画面，贴合主题；\n"
+        "3. 每个分镜的字段：\n"
+        "   - term：画面中文关键词（2~6 个字，如：面部按摩、樱花特写），具体到可搜索画面，贴合主题；\n"
+        "   - title：给拍摄者看的简短标题，格式「内容：对象」如「手法特写：面部清洁按摩」；\n"
+        "   - brief：拍摄简报，40 字以内，说明画面内容、主体、景别/机位与注意事项\n"
+        "     （如：美容师双手在顾客面部打圈清洁的手部特写，近景稳定，光线柔和）；\n"
         "4. 只输出 JSON 数组，不要任何其他文字，格式：\n"
-        '[{"text": "原句", "term": "画面关键词"}]\n\n'
+        '[{"text": "原句", "term": "关键词", "title": "简短标题", "brief": "拍摄简报"}]\n\n'
         f"视频主题：{subject or '（从文案推断）'}\n"
         f"视频文案：\n{script}"
     )
@@ -58,8 +62,17 @@ def _parse_shots(text: str) -> list[dict]:
             continue
         line = str(item.get("text") or "").strip()
         term = str(item.get("term") or "").strip()
+        title = str(item.get("title") or "").strip()
+        brief = str(item.get("brief") or "").strip()
         if line and term:
-            shots.append({"text": line, "term": term})
+            shots.append(
+                {
+                    "text": line,
+                    "term": term,
+                    "title": title or term,
+                    "brief": brief,
+                }
+            )
     return shots
 
 
@@ -105,3 +118,55 @@ def make_storyboard(
         )
 
     return utils.get_response(200, {"shots": shots})
+
+
+# ================= 拍摄需求（由视频生成任务产生的人话简报清单） =================
+
+
+class ShootNeedItem(BaseModel):
+    term: str = ""
+    title: str = ""
+    brief: str = ""
+
+
+class ShootNeedsRequest(BaseModel):
+    task_id: str
+    items: list[ShootNeedItem] = []
+
+
+class ShootNeedResolveRequest(BaseModel):
+    id: str
+    filename: str = ""
+
+
+@router.post("/shoot_needs", summary="Register shoot needs (material gaps) for a task")
+def register_shoot_needs(request: Request, body: ShootNeedsRequest):
+    added = shoot_needs_service.add_for_task(
+        body.task_id,
+        [item.model_dump() for item in body.items],
+    )
+    return utils.get_response(200, {"added": added})
+
+
+@router.get("/shoot_needs", summary="List shoot needs (all tasks, or filter by task_id)")
+def list_shoot_needs(request: Request, task_id: str | None = None):
+    if task_id:
+        needs = shoot_needs_service.needs_for_task(task_id)
+    else:
+        needs = shoot_needs_service.needs_for_task(None)
+    return utils.get_response(200, {"needs": needs})
+
+
+@router.get("/shoot_needs/open", summary="List open shoot needs across all tasks")
+def list_open_shoot_needs(request: Request):
+    return utils.get_response(200, {"needs": shoot_needs_service.aggregate_open()})
+
+
+@router.post("/shoot_needs/resolve", summary="Manually mark a shoot need as resolved")
+def resolve_shoot_need(request: Request, body: ShootNeedResolveRequest):
+    item = shoot_needs_service.resolve(body.id, body.filename)
+    if not item:
+        raise HttpException(
+            task_id=base.get_task_id(request), status_code=404, message="需求不存在或已补齐"
+        )
+    return utils.get_response(200, {"need": item})

@@ -6,6 +6,7 @@ import {
   Trash2,
   Undo2,
   Upload,
+  Camera,
 } from 'lucide-react'
 import {
   Button,
@@ -17,6 +18,7 @@ import {
   deleteMaterialFile,
   getMaterialLibrary,
   getMaterialTrash,
+  getShootNeeds,
   materialPreviewUrl,
   materialThumbUrl,
   purgeMaterialFile,
@@ -26,6 +28,7 @@ import {
   startMaterialIngest,
   getMaterialIngest,
   type MaterialLibraryEntry,
+  type ShootNeed,
   type TrashEntry,
 } from '../api/endpoints'
 import { useToast } from '../components/ui'
@@ -57,13 +60,17 @@ export function MaterialsPage() {
   const [editingTags, setEditingTags] = useState<string | null>(null)
   const [tagDraft, setTagDraft] = useState('')
   const [confirmPurge, setConfirmPurge] = useState<TrashEntry | null>(null)
+  // 拍摄任务：跨任务的素材缺口聚合（执行现场视图），点开看简报
+  const [openNeeds, setOpenNeeds] = useState<ShootNeed[]>([])
+  const [needsOpen, setNeedsOpen] = useState(false)
 
   const refresh = useCallback((silent = false) => {
     if (!silent) setRefreshing(true)
-    Promise.all([getMaterialLibrary(), getMaterialTrash()])
-      .then(([lib, trash]) => {
+    Promise.all([getMaterialLibrary(), getMaterialTrash(), getShootNeeds()])
+      .then(([lib, trash, needs]) => {
         setFiles(lib.files)
         setTrash(trash.files)
+        setOpenNeeds(needs.needs.filter((n) => n.status === 'open'))
       })
       .catch(() => toast('error', '素材库加载失败'))
       .finally(() => {
@@ -169,6 +176,24 @@ export function MaterialsPage() {
           </Button>
         </div>
       </div>
+
+      {/* 拍摄任务（跨任务聚合的素材缺口） */}
+      {openNeeds.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setNeedsOpen(true)}
+          className="flex w-full items-center gap-2.5 rounded-xl border border-warn/40 bg-warn/10 px-4 py-2.5 text-left transition-colors hover:bg-warn/20"
+        >
+          <Camera size={16} className="shrink-0 text-warn" />
+          <span className="text-sm font-medium text-warn">
+            拍摄任务 {openNeeds.length} 项待补
+          </span>
+          <span className="truncate text-xs text-muted">
+            {openNeeds.slice(0, 3).map((n) => n.title).join('；')}
+            {openNeeds.length > 3 ? '…' : ''} —— 点击查看拍摄简报，去拍摄后上传这里自动补齐
+          </span>
+        </button>
+      )}
 
       {/* 筛选 */}
       <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -414,6 +439,41 @@ export function MaterialsPage() {
             }}
           >
             确认删除
+          </Button>
+        </div>
+      </Modal>
+
+      {/* 拍摄任务简报（跨任务聚合，入库自动核销） */}
+      <Modal
+        open={needsOpen}
+        title="拍摄任务"
+        onClose={() => setNeedsOpen(false)}
+      >
+        <p className="text-xs text-muted">
+          这些镜头在相关视频里没有找到匹配画面。照简报拍摄或收集素材后上传到本页，入库打标命中即自动补齐对应任务。
+        </p>
+        <div className="mt-3 max-h-[55vh] space-y-3 overflow-y-auto pr-1">
+          {openNeeds.map((n) => (
+            <div key={n.id} className="rounded-xl border border-line bg-panel2 p-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-ink">
+                <Camera size={14} className="shrink-0 text-warn" />
+                <span>{n.title}</span>
+              </div>
+              {n.brief && (
+                <p className="mt-1.5 text-xs leading-relaxed text-muted">{n.brief}</p>
+              )}
+              <p className="mt-1.5 text-[11px] text-muted/70">
+                画面关键词：{n.term} · 来自任务 {n.task_id.slice(0, 8)}
+              </p>
+            </div>
+          ))}
+          {openNeeds.length === 0 && (
+            <p className="py-6 text-center text-sm text-muted">没有待补的拍摄任务</p>
+          )}
+        </div>
+        <div className="mt-4 flex justify-end">
+          <Button variant="secondary" onClick={() => setNeedsOpen(false)}>
+            知道了
           </Button>
         </div>
       </Modal>

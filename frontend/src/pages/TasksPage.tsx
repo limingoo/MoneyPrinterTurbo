@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   Music4,
   Captions,
+  Camera,
 } from 'lucide-react'
 import {
   Button,
@@ -20,7 +21,7 @@ import {
   Spinner,
   useToast,
 } from '../components/ui'
-import { deleteTask, getTasks } from '../api/endpoints'
+import { deleteTask, getTasks, getShootNeeds, type ShootNeed } from '../api/endpoints'
 import { TASK_STATE, type TaskStatus } from '../api/types'
 import { usePolling } from '../hooks'
 
@@ -55,6 +56,17 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   const [loading, setLoading] = useState(true)
   const [deleting, setDeleting] = useState<TaskStatus | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+  // 拍摄任务清单：need.task_id → 该任务的素材缺口
+  const [needs, setNeeds] = useState<ShootNeed[]>([])
+  const [needsFor, setNeedsFor] = useState<TaskStatus | null>(null)
+
+  const fetchNeeds = useCallback(async () => {
+    try {
+      setNeeds((await getShootNeeds()).needs)
+    } catch {
+      /* 清单拉取失败不影响任务列表 */
+    }
+  }, [])
 
   const fetchTasks = useCallback(
     async (silent = false) => {
@@ -76,7 +88,8 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   useEffect(() => {
     setLoading(true)
     fetchTasks()
-  }, [fetchTasks])
+    fetchNeeds()
+  }, [fetchTasks, fetchNeeds])
 
   const busy = tasks.some(
     (t) => t.state === TASK_STATE.PROCESSING || (t.state !== TASK_STATE.COMPLETE && t.state !== TASK_STATE.FAILED),
@@ -92,12 +105,16 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
       await deleteTask(deleting.task_id)
       toast('success', '任务已删除')
       fetchTasks(true)
+      fetchNeeds()
     } catch (e) {
       toast('error', e instanceof Error ? e.message : '删除失败')
     } finally {
       setDeleting(null)
     }
   }
+
+  const openNeeds = (taskId: string) =>
+    needs.filter((n) => n.task_id === taskId && n.status === 'open')
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
@@ -199,6 +216,17 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
                   <p className="text-xs text-muted">
                     共生成 {task.videos.length} 个视频
                   </p>
+                )}
+
+                {openNeeds(task.task_id).length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setNeedsFor(task)}
+                    className="flex items-center gap-1.5 self-start rounded-lg border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/20"
+                  >
+                    <Camera size={13} />
+                    待拍摄 {openNeeds(task.task_id).length} 项 · 查看拍摄简报
+                  </button>
                 )}
 
                 {/* 配音 / 字幕产物 */}
@@ -305,6 +333,45 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
           <Button variant="danger" onClick={handleDelete}>
             <Trash2 size={15} />
             确认删除
+          </Button>
+        </div>
+      </Modal>
+
+      {/* 拍摄任务清单（本片画面缺口的拍摄简报） */}
+      <Modal
+        open={!!needsFor}
+        title="本片拍摄清单"
+        onClose={() => setNeedsFor(null)}
+      >
+        <p className="text-xs text-muted">
+          这些镜头素材库里没有匹配画面，本次成片用近似画面补位。照简报拍摄或收集后上传到「素材库」，入库打标命中即自动补齐。
+        </p>
+        <div className="mt-3 max-h-[50vh] space-y-3 overflow-y-auto pr-1">
+          {needsFor &&
+            openNeeds(needsFor.task_id).map((n) => (
+              <div
+                key={n.id}
+                className="rounded-xl border border-line bg-panel2 p-3"
+              >
+                <div className="flex items-center gap-2 text-sm font-semibold text-ink">
+                  <Camera size={14} className="shrink-0 text-warn" />
+                  <span>{n.title}</span>
+                </div>
+                {n.brief && (
+                  <p className="mt-1.5 text-xs leading-relaxed text-muted">{n.brief}</p>
+                )}
+                {n.term && (
+                  <p className="mt-1.5 text-[11px] text-muted/70">画面关键词：{n.term}</p>
+                )}
+              </div>
+            ))}
+          {needsFor && openNeeds(needsFor.task_id).length === 0 && (
+            <p className="py-6 text-center text-sm text-muted">清单已全部补齐</p>
+          )}
+        </div>
+        <div className="mt-4 flex justify-end">
+          <Button variant="secondary" onClick={() => setNeedsFor(null)}>
+            知道了
           </Button>
         </div>
       </Modal>

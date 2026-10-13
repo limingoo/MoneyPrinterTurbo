@@ -827,6 +827,14 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                 })
                 logger.info(f"ingested: {seg_name} ({status}) tags={tags[:3]}")
 
+                if status == "ok":
+                    # 拍摄需求自动核销：标签命中未补齐需求即标记 resolved
+                    from app.services import shoot_needs as _shoot_needs
+
+                    _shoot_needs.resolve_by_tags(
+                        sorted(set(tags))[:6], tags_en[:6], seg_name
+                    )
+
         # 处理完成的原始文件移入 .trash 留底，库目录只保留拆好的段
         if original and original.is_file() and counts["accepted"] + counts["skipped"] > 0:
             shutil.move(str(original), str(Path(_trash_dir()) / filename))

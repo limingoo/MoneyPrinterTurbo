@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { Loader2, X, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Loader2, X, CheckCircle2, AlertCircle, Info } from 'lucide-react'
 
 /* ================= Button ================= */
 
@@ -414,11 +414,13 @@ export function Modal({
 
 interface ToastItem {
   id: number
-  kind: 'success' | 'error'
+  kind: 'success' | 'error' | 'info'
   text: string
 }
 
-const ToastContext = createContext<(kind: 'success' | 'error', text: string) => void>(
+type ToastKind = ToastItem['kind']
+
+const ToastContext = createContext<(kind: ToastKind, text: string) => void>(
   () => {},
 )
 
@@ -426,7 +428,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([])
   const idRef = useRef(0)
 
-  const push = useCallback((kind: 'success' | 'error', text: string) => {
+  const push = useCallback((kind: ToastKind, text: string) => {
     const id = ++idRef.current
     setItems((prev) => [...prev, { id, kind, text }])
     setTimeout(() => setItems((prev) => prev.filter((t) => t.id !== id)), 4200)
@@ -442,10 +444,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             className={`pointer-events-auto flex items-center gap-2 rounded-xl border px-4 py-2.5 text-sm shadow-xl backdrop-blur-md animate-fade-up ${
               t.kind === 'success'
                 ? 'border-success/30 bg-panel/95 text-success'
-                : 'border-danger/30 bg-panel/95 text-danger'
+                : t.kind === 'info'
+                  ? 'border-brand/30 bg-panel/95 text-ink'
+                  : 'border-danger/30 bg-panel/95 text-danger'
             }`}
           >
-            {t.kind === 'success' ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+            {t.kind === 'success' ? (
+              <CheckCircle2 size={16} />
+            ) : t.kind === 'info' ? (
+              <Info size={16} />
+            ) : (
+              <AlertCircle size={16} />
+            )}
             {t.text}
           </div>
         ))}
