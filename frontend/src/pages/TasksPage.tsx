@@ -98,6 +98,9 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   // 有进行中的任务时 3 秒轮询，否则 15 秒
   usePolling(() => fetchTasks(true), 3000, busy)
   usePolling(() => fetchTasks(true), 15000, !busy && tasks.length > 0)
+  // 拍摄清单跟着一起轻量刷新（提交新任务 / 素材入库核销都能及时反映）
+  usePolling(fetchNeeds, 3000, busy)
+  usePolling(fetchNeeds, 20000, !busy)
 
   const handleDelete = async () => {
     if (!deleting) return
