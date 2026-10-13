@@ -12,6 +12,8 @@ import {
   Music4,
   Captions,
   Camera,
+  Play,
+  X,
 } from 'lucide-react'
 import {
   Button,
@@ -21,8 +23,9 @@ import {
   Spinner,
   useToast,
 } from '../components/ui'
-import { deleteTask, getTasks, getShootNeeds, removeShootNeed, type ShootNeed } from '../api/endpoints'
+import { deleteTask, getTasks, getShootNeeds, getPendingCreations, removeShootNeed, removePendingCreation, type ShootNeed, type PendingCreation } from '../api/endpoints'
 import { TASK_STATE, type TaskStatus } from '../api/types'
+import { saveForm } from '../store/form'
 import { usePolling } from '../hooks'
 
 const PAGE_SIZE = 12
@@ -59,12 +62,22 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   // 拍摄任务清单：need.task_id → 该任务的素材缺口
   const [needs, setNeeds] = useState<ShootNeed[]>([])
   const [needsFor, setNeedsFor] = useState<TaskStatus | null>(null)
+  // 等待素材的挂起创作（素材命中后可一键继续生成）
+  const [pendings, setPendings] = useState<PendingCreation[]>([])
 
   const fetchNeeds = useCallback(async () => {
     try {
       setNeeds((await getShootNeeds()).needs)
     } catch {
       /* 清单拉取失败不影响任务列表 */
+    }
+  }, [])
+
+  const fetchPendings = useCallback(async () => {
+    try {
+      setPendings((await getPendingCreations()).pendings)
+    } catch {
+      /* 挂起列表拉取失败不影响任务列表 */
     }
   }, [])
 
@@ -89,7 +102,8 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
     setLoading(true)
     fetchTasks()
     fetchNeeds()
-  }, [fetchTasks, fetchNeeds])
+    fetchPendings()
+  }, [fetchTasks, fetchNeeds, fetchPendings])
 
   const busy = tasks.some(
     (t) => t.state === TASK_STATE.PROCESSING || (t.state !== TASK_STATE.COMPLETE && t.state !== TASK_STATE.FAILED),
@@ -101,6 +115,9 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   // 拍摄清单跟着一起轻量刷新（提交新任务 / 素材入库核销都能及时反映）
   usePolling(fetchNeeds, 3000, busy)
   usePolling(fetchNeeds, 20000, !busy)
+  // 挂起创作跟随轮询：素材入库命中后会转"就绪"
+  usePolling(fetchPendings, 3000, busy)
+  usePolling(fetchPendings, 20000, !busy)
 
   const handleDelete = async () => {
     if (!deleting) return
@@ -141,6 +158,77 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
           </Button>
         </div>
       </div>
+
+      {/* 等待素材的挂起创作：素材命中后一键继续 */}
+      {pendings.length > 0 && (
+        <div className="space-y-2">
+          {pendings.map((p) => {
+            return (
+              <div
+                key={p.id}
+                className="flex flex-wrap items-center gap-3 rounded-2xl border border-warn/40 bg-warn/10 px-4 py-3"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-semibold text-ink">
+                      {p.subject}
+                    </span>
+                    {p.ready ? (
+                      <Badge tone="success">素材已齐 ✓</Badge>
+                    ) : (
+                      <Badge tone="warn">
+                        等待素材 {p.covered?.length ?? 0}/{p.terms.length} 命中
+                      </Badge>
+                    )}
+                  </div>
+                  {(p.missing?.length ?? 0) > 0 && (
+                    <p className="mt-1 truncate text-xs text-muted">
+                      缺：{p.missing!.slice(0, 4).join('、')}
+                      {p.missing!.length > 4 ? '…' : ''} —— 到「素材库」上传对应画面（简报见素材库页）
+                    </p>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  {p.ready && (
+                    <Button
+                      variant="primary"
+                      className="h-8 px-3 text-xs"
+                      onClick={() => {
+                        try {
+                          saveForm(JSON.parse(p.snapshot))
+                          toast('info', '创作表单已恢复，补选配音后点「生成视频」即可')
+                          onGoCreate()
+                        } catch {
+                          toast('error', '快照恢复失败，请重新创作')
+                        }
+                      }}
+                    >
+                      <Play size={13} />
+                      继续生成
+                    </Button>
+                  )}
+                  <Button
+                    variant="danger"
+                    className="h-8 px-2.5 text-xs"
+                    onClick={() => {
+                      removePendingCreation(p.id)
+                        .then(() => {
+                          toast('success', '已取消该等待')
+                          fetchPendings()
+                        })
+                        .catch((e) =>
+                          toast('error', e instanceof Error ? e.message : '取消失败'),
+                        )
+                    }}
+                  >
+                    <X size={13} />
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       {loading ? (
         <Spinner label="加载任务中…" />

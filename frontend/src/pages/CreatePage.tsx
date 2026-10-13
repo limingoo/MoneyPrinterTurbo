@@ -42,6 +42,7 @@ import {
   getMaterialLibrary,
   makeStoryboard,
   addShootNeeds,
+  addPendingCreation,
   type ClonedVoiceEntry,
   type MaterialCheckResult,
   type StoryboardShot,
@@ -103,10 +104,11 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
   const [checkResult, setCheckResult] = useState<MaterialCheckResult | null>(null)
   const [checking, setChecking] = useState(false)
   const [remixing, setRemixing] = useState(false)
-  // 持久失败记录（0 命中拦截）：横幅常驻直到用户处置（改网络源/补素材后成功/手动关闭）
+  // 持久失败记录（挂起/拦截）：横幅常驻直到用户处置（侧栏"等待素材"里继续或取消）
   const [submitFailure, setSubmitFailure] = useState<{
     reason: string
     shots: StoryboardShot[]
+    pendingId?: string
   } | null>(null)
 
   const parseTermList = useCallback(
@@ -305,66 +307,79 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     }
 
     // ===== 素材准备（全部即时操作，毫秒级，不让人在创作页等 LLM）=====
-    // 分镜拆分改为任务创建成功后的后台动作：缺口简报直接出现在任务卡片上。
+    // 素材库源：全命中才出片；部分/零命中 → 挂起"等待素材"（续跑按钮）。
     let formToSubmit: CreateForm = form
     let runBackgroundStoryboard = false
+    const customAudioUsed = !!customAudio
 
     setSubmitting(true)
     if (form.video_source === 'local') {
       setSubmitPhase('match')
       try {
         const terms = parseTermList()
-        const result = terms.length ? await checkMaterials(terms) : null
-        const seenFiles = new Set<string>()
-        const files: { file: string; tags: string[] }[] = []
-        const pushFile = (file: string) => {
-          if (!seenFiles.has(file)) {
-            seenFiles.add(file)
-            files.push({ file, tags: [] })
-          }
-        }
-        if (result) {
-          for (const matched of Object.values(result.matched)) {
-            matched.forEach(pushFile)
-          }
-        }
-        if (files.length === 0) {
-          if (result) {
-            // 有关键词但 0 命中：用无关素材硬拼 = 废片，不出片（秒拦，不再等 LLM）
+        if (terms.length === 0) {
+          // 用户没给关键词（明确的全库混剪意图）：直接取库内全部可用素材
+          const lib = await getMaterialLibrary()
+          const usable = lib.files.filter((f) => f.status === 'ok').map((f) => f.file)
+          if (usable.length === 0) {
             stopSubmit()
+            setSubmitFailure({ reason: '素材库里还没有任何可用素材', shots: [] })
+            toast('error', '本次未创建任务：请先到「素材库」页上传素材，或改用网络来源。')
+            return
+          }
+          formToSubmit = {
+            ...form,
+            local_materials: usable.slice(0, 12).map((file) => ({ name: file, file, size: 0 })),
+          }
+        } else {
+          // 有关键词：逐词命中；命中不全 → 挂起等待素材（用户规则：宁缺毋滥）
+          const result = await checkMaterials(terms)
+          const seenFiles = new Set<string>()
+          const files: string[] = []
+          if (result) {
+            for (const matched of Object.values(result.matched)) {
+              matched.forEach((f) => {
+                if (!seenFiles.has(f)) {
+                  seenFiles.add(f)
+                  files.push(f)
+                }
+              })
+            }
+          }
+          const missing = result?.missing ?? terms
+          if (missing.length === 0) {
+            // 全命中 → 立即出片（后台分镜分析仍会核对逐镜头缺口）
+            runBackgroundStoryboard = form.storyboard_align
+            formToSubmit = {
+              ...form,
+              local_materials: files.slice(0, 12).map((file) => ({ name: file, file, size: 0 })),
+              video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
+            }
+          } else {
+            // 部分命中 / 零命中 → 等待素材挂起（自定义配音文件不可序列化，挂起后需重选）
+            stopSubmit()
+            if (customAudioUsed) {
+              toast(
+                'info',
+                '自定义配音无法随"等待素材"保存——请先补素材再选择配音文件生成，或此刻改用克隆音色。',
+              )
+            }
+            const pendingResp = await addPendingCreation({
+              snapshot: { ...form, local_materials: [] },
+              terms,
+              subject: form.video_subject.trim() || '未命名创作',
+            })
             setSubmitFailure({
-              reason: `素材库没有与关键词匹配的画面（${terms.length} 个关键词 0 段命中）——用无关素材硬拼只会出废片，故不生成`,
+              reason: `已挂起为「等待素材」：关键词命中 ${terms.length - missing.length}/${terms.length}`,
               shots: [],
+              pendingId: pendingResp.pending.id,
             })
             toast(
-              'error',
-              '关键词没有命中任何素材，本次不生成。到「素材库」补对应画面，或改用网络素材。',
+              'info',
+              `已挂起等待素材（缺 ${missing.length} 项）。入库命中后任务页出现「继续生成」；此刻不会出废片。`,
             )
             return
           }
-          if (!terms.length) {
-            // 用户没给关键词（明确的全库混剪意图）：直接取库内全部可用素材
-            const lib = await getMaterialLibrary()
-            lib.files.filter((f) => f.status === 'ok').forEach((f) => pushFile(f.file))
-          }
-        }
-        if (files.length === 0) {
-          // 库彻底为空——没内容可拼，拦截并留下持久提示
-          stopSubmit()
-          setSubmitFailure({
-            reason: '素材库里还没有任何可用素材',
-            shots: [],
-          })
-          toast('error', '本次未创建任务：请先到「素材库」页上传素材，或改用网络来源。')
-          return
-        }
-        runBackgroundStoryboard = form.storyboard_align
-        formToSubmit = {
-          ...form,
-          local_materials: files
-            .slice(0, 12)
-            .map(({ file }) => ({ name: file, file, size: 0 })),
-          video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
         }
       } catch (e) {
         toast('error', e instanceof Error ? e.message : '素材匹配失败，请重试或更换素材来源')
@@ -438,10 +453,10 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-sm font-semibold text-warn">
-                本次未创建视频任务 · {submitFailure.reason}
+                素材不全，本次未出片 · {submitFailure.reason}
               </p>
               <p className="mt-1 text-xs text-muted">
-                先到「素材库」页上传素材（拍一段 10 秒店内视频即可），或把素材来源改为「网络素材」立即出片。
+                按"宁缺毋滥"规则：只用命中的画面。到「素材库」页补素材，入库打标命中后任务页顶部的「等待素材」条目会出现"继续生成"；或改用网络素材立即出片。
               </p>
             </div>
             <button

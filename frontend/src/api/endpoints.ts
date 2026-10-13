@@ -372,6 +372,37 @@ export function removeShootNeed(id: string): Promise<{ removed: string }> {
   return del(`/api/v1/shoot_needs/${id}`)
 }
 
+/* ================= 等待素材的挂起创作 ================= */
+
+export interface PendingCreation {
+  id: string
+  subject: string
+  /** 创作表单快照（JSON 字符串，续跑时原样写回表单存储） */
+  snapshot: string
+  terms: string[]
+  created_at?: string
+  covered?: string[]
+  missing?: string[]
+  ready?: boolean
+}
+
+/** 素材不全的提交挂起为"等待素材"条目（不出废片） */
+export function addPendingCreation(body: {
+  snapshot: unknown
+  terms: string[]
+  subject: string
+}): Promise<{ pending: PendingCreation }> {
+  return post('/api/v1/pending_creations', body)
+}
+
+export function getPendingCreations(): Promise<{ pendings: PendingCreation[] }> {
+  return get('/api/v1/pending_creations')
+}
+
+export function removePendingCreation(id: string): Promise<{ removed: string }> {
+  return del(`/api/v1/pending_creations/${id}`)
+}
+
 /* ================= 声音克隆 ================= */
 
 export function cloneVoice(

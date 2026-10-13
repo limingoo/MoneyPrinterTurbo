@@ -20,6 +20,7 @@ from app.controllers import base
 from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.services import llm as llm_service
+from app.services import pending_creations as pending_service
 from app.services import shoot_needs as shoot_needs_service
 from app.utils import utils
 
@@ -192,3 +193,35 @@ def resolve_shoot_need(request: Request, body: ShootNeedResolveRequest):
             task_id=base.get_task_id(request), status_code=404, message="需求不存在或已补齐"
         )
     return utils.get_response(200, {"need": item})
+
+
+# ================= 等待素材的挂起创作（中断续跑） =================
+
+
+class PendingCreationRequest(BaseModel):
+    snapshot: dict
+    terms: list[str] = []
+    subject: str = ""
+
+
+@router.post(
+    "/pending_creations",
+    summary="Park an interrupted creation waiting for library materials",
+)
+def add_pending_creation(request: Request, body: PendingCreationRequest):
+    item = pending_service.add(body.snapshot, body.terms, body.subject)
+    return utils.get_response(200, {"pending": item})
+
+
+@router.get("/pending_creations", summary="List parked creations with live coverage")
+def list_pending_creations(request: Request):
+    return utils.get_response(200, {"pendings": pending_service.list_all()})
+
+
+@router.delete(
+    "/pending_creations/{pending_id}",
+    summary="Cancel a parked creation",
+)
+def remove_pending_creation(request: Request, pending_id: str = Path(...)):
+    pending_service.remove(pending_id)
+    return utils.get_response(200, {"removed": pending_id})
