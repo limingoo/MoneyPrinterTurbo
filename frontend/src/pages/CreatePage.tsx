@@ -429,6 +429,8 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
         /* 清单登记失败不影响任务 */
       }
     }
+    // 成功提交后立即复位按钮（此前成功路径漏掉复位导致按钮永久转圈）
+    stopSubmit()
     onCreated()
   }
 
