@@ -39,6 +39,7 @@ import {
   uploadBgm,
   checkMaterials,
   remixMaterials,
+  getMaterialLibrary,
   makeStoryboard,
   addShootNeeds,
   type ClonedVoiceEntry,
@@ -303,114 +304,61 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
       return
     }
 
-    // 素材来源：分镜对齐 / 关键词匹配 / 全库混剪
-    // 分镜路径中未被库内任何标签命中的镜头 → 登记为拍摄任务（跟着任务走）
-    let missingShots: StoryboardShot[] = []
-
+    // ===== 素材准备（全部即时操作，毫秒级，不让人在创作页等 LLM）=====
+    // 分镜拆分改为任务创建成功后的后台动作：缺口简报直接出现在任务卡片上。
     let formToSubmit: CreateForm = form
+    let runBackgroundStoryboard = false
+
+    setSubmitting(true)
     if (form.video_source === 'local') {
-      setSubmitting(true)
+      setSubmitPhase('match')
       try {
-        // 分镜拆分失败 = 停止提交并明确报错（保持开关语义：要拆分镜就按分镜来，不静默换方式）
-        let alignShots: StoryboardShot[] | null = null
-        if (form.storyboard_align) {
-          setSubmitPhase('storyboard')
-          try {
-            alignShots = (
-              await makeStoryboard({
-                video_subject: form.video_subject.trim(),
-                video_script: form.video_script.trim(),
-                video_language: form.video_language,
-              })
-            ).shots
-          } catch {
-            stopSubmit()
-            toast(
-              'error',
-              '分镜拆分失败（LLM 网关连续两次超时）。已停止提交：等 2~3 分钟再点生成（连点会被限流），或在「画面」页签关闭分镜对齐。',
-            )
-            return
+        const terms = parseTermList()
+        const result = terms.length ? await checkMaterials(terms) : null
+        const seenFiles = new Set<string>()
+        const files: { file: string; tags: string[] }[] = []
+        const pushFile = (file: string) => {
+          if (!seenFiles.has(file)) {
+            seenFiles.add(file)
+            files.push({ file, tags: [] })
           }
         }
-        setSubmitPhase('match')
-        if (alignShots) {
-          // ===== 分镜对齐：逐镜头匹配库内标签 → 顺序排列 =====
-          const terms = [...new Set(alignShots.map((s) => s.term))]
-          const match = terms.length ? await checkMaterials(terms) : null
-          const pool: Record<string, string[]> = match?.matched ?? {}
-          if (Object.keys(pool).length === 0) {
-            // 拦截失败不能只有一闪而过的 toast——留下持久失败记录：
-            // 页面横幅 + 素材库登记拍摄简报（用户补素材后自动清核销）
-            stopSubmit()
-            setSubmitFailure({
-              reason: '素材库里没有匹配任何分镜的素材（0 段命中）',
-              shots: alignShots,
-            })
-            addShootNeeds(
-              'creation',
-              alignShots.map((s) => ({
-                term: s.term,
-                title: s.title || s.term,
-                brief: s.brief || '',
-              })),
-            ).catch(() => {})
-            toast('error', '本次未创建任务：素材库没有匹配分镜的画面。拍摄简报已生成 → 见下方横幅。')
-            return
+        if (result) {
+          for (const matched of Object.values(result.matched)) {
+            matched.forEach(pushFile)
           }
-          missingShots = alignShots.filter((s) => !(pool[s.term]?.length > 0))
-          const used = new Set<string>()
-          const ordered: { name: string; file: string; size: number }[] = []
-          for (const shot of alignShots) {
-            const candidates = pool[shot.term] ?? []
-            let chosen = candidates.find((f) => !used.has(f))
-            if (!chosen) {
-              // 镜头多于素材时循环复用（保留重复镜头以铺满时长）
-              chosen = candidates[0]
-            }
-            if (chosen) {
-              ordered.push({ name: chosen, file: chosen, size: 0 })
-              used.add(chosen)
-            }
-          }
-          formToSubmit = {
-            ...form,
-            local_materials: ordered,
-            video_concat_mode: 'sequential',
-          }
-        } else {
-          // ===== 普通模式：关键词匹配（或全库混剪） =====
-          const terms = parseTermList()
-          const result = terms.length ? await checkMaterials(terms) : null
-          const files = new Set<string>()
-          if (result) {
-            for (const matched of Object.values(result.matched)) {
-              matched.forEach((f) => files.add(f))
-            }
-          }
-          if (files.size === 0) {
-            toast(
-              'error',
-              terms.length
-                ? '素材库里没有与关键词匹配的素材。请到「素材库」页补充，或更换素材来源。'
-                : '素材库里还没有素材。请先到「素材库」页上传，或更换素材来源。',
-            )
-            stopSubmit()
-            return
-          }
-          formToSubmit = {
-            ...form,
-            local_materials: [...files].slice(0, 12).map((file) => ({
-              name: file,
-              file,
-              size: 0,
-            })),
-          }
+        }
+        if (!result || Object.keys(result.matched).length === 0) {
+          // 标签没命中 ≠ 没素材：库非空就继续出片（全库混剪），
+          // 缺的镜头由后台分镜分析登记到任务卡片
+          const lib = await getMaterialLibrary()
+          lib.files
+            .filter((f) => f.status === 'ok')
+            .forEach((f) => pushFile(f.file))
+        }
+        if (files.length === 0) {
+          // 库彻底为空——没内容可拼，拦截并留下持久提示
+          stopSubmit()
+          setSubmitFailure({
+            reason: '素材库里还没有任何可用素材',
+            shots: [],
+          })
+          toast('error', '本次未创建任务：请先到「素材库」页上传素材，或改用网络来源。')
+          return
+        }
+        runBackgroundStoryboard = form.storyboard_align
+        formToSubmit = {
+          ...form,
+          local_materials: files
+            .slice(0, 12)
+            .map(({ file }) => ({ name: file, file, size: 0 })),
+          video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
+        }
+        if (!result || Object.keys(result.matched).length === 0) {
+          toast('info', '库内标签暂未命中关键词，本次用全部可用素材生成；分镜缺口生成后见任务卡片')
         }
       } catch (e) {
-        toast(
-          'error',
-          e instanceof Error ? e.message : '素材准备失败，请重试或更换素材来源',
-        )
+        toast('error', e instanceof Error ? e.message : '素材匹配失败，请重试或更换素材来源')
         stopSubmit()
         return
       }
@@ -427,28 +375,42 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
       toast('success', '任务已提交，正在生成…')
     }
 
-    // 缺口镜头登记为拍摄任务清单（任务页卡片可见，素材上传后自动核销）
-    if (missingShots.length > 0 && taskId) {
-      try {
-        const toBrief = (s: StoryboardShot) => ({
-          term: s.term,
-          title: s.title || s.term,
-          brief: s.brief || '',
-        })
-        const added = (await addShootNeeds(taskId, missingShots.map(toBrief))).added
-        if (added > 0) {
-          toast(
-            'info',
-            `有 ${added} 个镜头素材库里没有，已生成拍摄简报 → 到「任务」页查看该片的拍摄清单。本次先用近似画面补位。`,
-          )
-        }
-      } catch {
-        /* 清单登记失败不影响任务 */
-      }
-    }
     // 成功提交后立即复位按钮（此前成功路径漏掉复位导致按钮永久转圈）
     stopSubmit()
     onCreated()
+
+    // ===== 后台分镜分析（不阻塞提交，用户已可离开本页）=====
+    // 成功后逐镜头比对库内标签，把缺失镜头的拍摄简报登记到任务卡片上。
+    // 每天/每次点击都重算，结果通过任务页轮询展示。
+    if (runBackgroundStoryboard && taskId) {
+      void (async () => {
+        try {
+          const shots = (
+            await makeStoryboard({
+              video_subject: form.video_subject.trim(),
+              video_script: form.video_script.trim(),
+              video_language: form.video_language,
+            })
+          ).shots
+          const terms = [...new Set(shots.map((s) => s.term))]
+          const match = terms.length ? await checkMaterials(terms) : null
+          const pool: Record<string, string[]> = match?.matched ?? {}
+          const missing = shots.filter((s) => !(pool[s.term]?.length > 0))
+          if (missing.length > 0) {
+            await addShootNeeds(
+              taskId,
+              missing.map((s) => ({
+                term: s.term,
+                title: s.title || s.term,
+                brief: s.brief || '',
+              })),
+            )
+          }
+        } catch {
+          /* 后台分镜失败不影响已提交的任务；用户可再次生成时重试 */
+        }
+      })()
+    }
   }
 
   const CONFIG_TABS: { key: ConfigTab; label: string; icon: React.ReactElement }[] = [
@@ -470,19 +432,8 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                 本次未创建视频任务 · {submitFailure.reason}
               </p>
               <p className="mt-1 text-xs text-muted">
-                分镜拆分成功，共 {submitFailure.shots.length} 个镜头——拍摄简报已登记到「素材库」页（黄色"拍摄任务"横条）。补素材上传后这里再点生成即可；或把素材来源改为「网络素材」先行出片。
+                先到「素材库」页上传素材（拍一段 10 秒店内视频即可），或把素材来源改为「网络素材」立即出片。
               </p>
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {submitFailure.shots.slice(0, 8).map((s, i) => (
-                  <span
-                    key={i}
-                    className="rounded-md bg-panel2 px-2 py-0.5 text-[11px] text-muted"
-                    title={s.brief || ''}
-                  >
-                    {s.title || s.term}
-                  </span>
-                ))}
-              </div>
             </div>
             <button
               type="button"
@@ -513,11 +464,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
         </Button>
         {submitting && (
           <span className="inline-flex items-center gap-1.5 text-xs text-muted">
-            {submitPhase === 'storyboard'
-              ? '正在拆分镜…（免费/共享 LLM 最慢约 3 分钟，含自动重试）'
-              : submitPhase === 'match'
-                ? '正在匹配素材库画面…'
-                : '正在提交任务…'}
+            {submitPhase === 'match' ? '正在匹配素材库画面…' : '正在提交任务…'}
           </span>
         )}
         <Button
