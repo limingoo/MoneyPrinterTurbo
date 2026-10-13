@@ -13,7 +13,7 @@
 import json
 import re
 
-from fastapi import Depends, Request
+from fastapi import Depends, Path, Request
 from pydantic import BaseModel
 
 from app.controllers import base
@@ -163,6 +163,8 @@ def register_shoot_needs(request: Request, body: ShootNeedsRequest):
 
 @router.get("/shoot_needs", summary="List shoot needs (all tasks, or filter by task_id)")
 def list_shoot_needs(request: Request, task_id: str | None = None):
+    # 懒清理：绑定的视频任务已删除/取消的需求自动丢弃，避免孤儿挂列表
+    shoot_needs_service.prune_orphans()
     if task_id:
         needs = shoot_needs_service.needs_for_task(task_id)
     else:
@@ -172,7 +174,14 @@ def list_shoot_needs(request: Request, task_id: str | None = None):
 
 @router.get("/shoot_needs/open", summary="List open shoot needs across all tasks")
 def list_open_shoot_needs(request: Request):
+    shoot_needs_service.prune_orphans()
     return utils.get_response(200, {"needs": shoot_needs_service.aggregate_open()})
+
+
+@router.delete("/shoot_needs/{need_id}", summary="Remove a shoot need (manual ignore)")
+def remove_shoot_need(request: Request, need_id: str = Path(...)):
+    shoot_needs_service.remove(need_id)
+    return utils.get_response(200, {"removed": need_id})
 
 
 @router.post("/shoot_needs/resolve", summary="Manually mark a shoot need as resolved")

@@ -367,6 +367,11 @@ export function resolveShootNeed(id: string, filename = ''): Promise<{ need: Sho
   return post('/api/v1/shoot_needs/resolve', { id, filename })
 }
 
+/** 忽略并删除一条需求 */
+export function removeShootNeed(id: string): Promise<{ removed: string }> {
+  return del(`/api/v1/shoot_needs/${id}`)
+}
+
 /* ================= 声音克隆 ================= */
 
 export function cloneVoice(

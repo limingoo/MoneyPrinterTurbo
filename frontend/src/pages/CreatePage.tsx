@@ -102,6 +102,11 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
   const [checkResult, setCheckResult] = useState<MaterialCheckResult | null>(null)
   const [checking, setChecking] = useState(false)
   const [remixing, setRemixing] = useState(false)
+  // 持久失败记录（0 命中拦截）：横幅常驻直到用户处置（改网络源/补素材后成功/手动关闭）
+  const [submitFailure, setSubmitFailure] = useState<{
+    reason: string
+    shots: StoryboardShot[]
+  } | null>(null)
 
   const parseTermList = useCallback(
     () =>
@@ -334,11 +339,22 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           const match = terms.length ? await checkMaterials(terms) : null
           const pool: Record<string, string[]> = match?.matched ?? {}
           if (Object.keys(pool).length === 0) {
-            toast(
-              'error',
-              '素材库里没有匹配任何分镜的素材。请到「素材库」页补充，或关闭分镜对齐改用网络来源。',
-            )
+            // 拦截失败不能只有一闪而过的 toast——留下持久失败记录：
+            // 页面横幅 + 素材库登记拍摄简报（用户补素材后自动清核销）
             stopSubmit()
+            setSubmitFailure({
+              reason: '素材库里没有匹配任何分镜的素材（0 段命中）',
+              shots: alignShots,
+            })
+            addShootNeeds(
+              'creation',
+              alignShots.map((s) => ({
+                term: s.term,
+                title: s.title || s.term,
+                brief: s.brief || '',
+              })),
+            ).catch(() => {})
+            toast('error', '本次未创建任务：素材库没有匹配分镜的画面。拍摄简报已生成 → 见下方横幅。')
             return
           }
           missingShots = alignShots.filter((s) => !(pool[s.term]?.length > 0))
@@ -402,6 +418,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
 
     let taskId: string | undefined
     setSubmitPhase(null)
+    setSubmitFailure(null)
     if (customAudio) {
       taskId = (await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)).task_id
       toast('success', '任务已提交（使用自定义配音），正在生成…')
@@ -444,6 +461,39 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
 
   return (
     <div className="flex h-[calc(100vh-4rem)] flex-col lg:overflow-hidden max-lg:pb-8">
+      {/* ===== 持久失败横幅：提交被拦截（素材无匹配等），常驻直到处置 ===== */}
+      {submitFailure && (
+        <div className="animate-fade-up mb-3 rounded-xl border border-warn/40 bg-warn/10 p-3.5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-warn">
+                本次未创建视频任务 · {submitFailure.reason}
+              </p>
+              <p className="mt-1 text-xs text-muted">
+                分镜拆分成功，共 {submitFailure.shots.length} 个镜头——拍摄简报已登记到「素材库」页（黄色"拍摄任务"横条）。补素材上传后这里再点生成即可；或把素材来源改为「网络素材」先行出片。
+              </p>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {submitFailure.shots.slice(0, 8).map((s, i) => (
+                  <span
+                    key={i}
+                    className="rounded-md bg-panel2 px-2 py-0.5 text-[11px] text-muted"
+                    title={s.brief || ''}
+                  >
+                    {s.title || s.term}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="shrink-0 text-xs text-muted transition-colors hover:text-ink"
+              onClick={() => setSubmitFailure(null)}
+            >
+              关闭
+            </button>
+          </div>
+        </div>
+      )}
       {/* ===== 第一行：主题 + 提交 + 轻量试错 ===== */}
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         <Input

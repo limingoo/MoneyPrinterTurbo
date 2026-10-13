@@ -21,7 +21,7 @@ import {
   Spinner,
   useToast,
 } from '../components/ui'
-import { deleteTask, getTasks, getShootNeeds, type ShootNeed } from '../api/endpoints'
+import { deleteTask, getTasks, getShootNeeds, removeShootNeed, type ShootNeed } from '../api/endpoints'
 import { TASK_STATE, type TaskStatus } from '../api/types'
 import { usePolling } from '../hooks'
 
@@ -356,9 +356,20 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
                 key={n.id}
                 className="rounded-xl border border-line bg-panel2 p-3"
               >
-                <div className="flex items-center gap-2 text-sm font-semibold text-ink">
-                  <Camera size={14} className="shrink-0 text-warn" />
-                  <span>{n.title}</span>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-ink">
+                    <Camera size={14} className="shrink-0 text-warn" />
+                    <span>{n.title}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="shrink-0 text-[11px] text-muted transition-colors hover:text-danger"
+                    onClick={() => {
+                      removeShootNeed(n.id).then(() => fetchNeeds()).catch(() => {})
+                    }}
+                  >
+                    忽略
+                  </button>
                 </div>
                 {n.brief && (
                   <p className="mt-1.5 text-xs leading-relaxed text-muted">{n.brief}</p>

@@ -19,6 +19,7 @@ import {
   getMaterialLibrary,
   getMaterialTrash,
   getShootNeeds,
+  removeShootNeed,
   materialPreviewUrl,
   materialThumbUrl,
   purgeMaterialFile,
@@ -455,15 +456,29 @@ export function MaterialsPage() {
         <div className="mt-3 max-h-[55vh] space-y-3 overflow-y-auto pr-1">
           {openNeeds.map((n) => (
             <div key={n.id} className="rounded-xl border border-line bg-panel2 p-3">
-              <div className="flex items-center gap-2 text-sm font-semibold text-ink">
-                <Camera size={14} className="shrink-0 text-warn" />
-                <span>{n.title}</span>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-ink">
+                  <Camera size={14} className="shrink-0 text-warn" />
+                  <span>{n.title}</span>
+                </div>
+                <button
+                  type="button"
+                  className="shrink-0 text-[11px] text-muted transition-colors hover:text-danger"
+                  onClick={() => {
+                    removeShootNeed(n.id)
+                      .then(() => refresh(true))
+                      .catch((e) => toast('error', e instanceof Error ? e.message : '忽略失败'))
+                  }}
+                >
+                  忽略
+                </button>
               </div>
               {n.brief && (
                 <p className="mt-1.5 text-xs leading-relaxed text-muted">{n.brief}</p>
               )}
               <p className="mt-1.5 text-[11px] text-muted/70">
-                画面关键词：{n.term} · 来自任务 {n.task_id.slice(0, 8)}
+                画面关键词：{n.term}
+                {n.task_id === 'creation' ? ' · 来自创作拦截' : ` · 来自任务 ${n.task_id.slice(0, 8)}`}
               </p>
             </div>
           ))}

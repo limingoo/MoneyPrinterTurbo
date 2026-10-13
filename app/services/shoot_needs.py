@@ -152,6 +152,41 @@ def resolve_by_tags(tags: list, tags_en: list, filename: str) -> list[dict]:
     return resolved
 
 
+def remove(item_id: str) -> None:
+    """移除一条需求（用户手动"忽略"）。"""
+
+    remaining = [item for item in _items() if item.get("id") != item_id]
+    if len(remaining) != len(_items()):
+        _save(remaining)
+
+
+_DRAFT_TASK_ID = "creation"  # 创作页提交被拦下（无任务创建的拍摄需求草稿）
+
+def prune_orphans() -> None:
+    """懒清理：绑定的视频任务已不存在（删除/取消）时，丢弃其未补齐需求。
+
+    'creation' 草稿（无任务的创作登记）不受影响，仅由用户忽略或素材命中核销。
+    """
+
+    from app.services import state as sm
+
+    items = _items()
+    kept = []
+    changed = False
+    for item in items:
+        task_id = item.get("task_id")
+        if item.get("status") != "resolved" and task_id and task_id != _DRAFT_TASK_ID:
+            # 物理查询任务是否存在：不在了就清掉（含 resolved 的一并丢弃——
+            # 任务已消失，历史简报也不再有对象）
+            if sm.state.get_task(task_id) is None:
+                changed = True
+                logger.info(f"shoot need pruned (task gone): {item.get('title')!r}")
+                continue
+        kept.append(item)
+    if changed:
+        _save(kept)
+
+
 def remove_for_task(task_id: str) -> None:
     """任务删除时清理其未补齐需求（已 resolve 的历史保留）。"""
 
