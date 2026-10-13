@@ -90,8 +90,21 @@ def make_storyboard(
 
     prompt = _build_prompt(body.video_subject, script, max(3, min(body.max_shots, 12)))
 
-    # 走统一 LLM 响应链（含运行时 provider 扩展）；失败会以 "Error: ..." 字符串返回
-    response = llm_service._generate_response(prompt)
+    # 走统一 LLM 响应链（含运行时 provider 扩展）；失败会以 "Error: ..." 字符串返回。
+    # OpenCode Go 网关常有 >120s 的瞬时抖动，这里自动重试一次，吸收间隙性失败。
+    response = ""
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            import time
+
+            time.sleep(15)
+        response = llm_service._generate_response(prompt)
+        if response and not response.startswith("Error: "):
+            break
+        utils.logger.warning(
+            f"storyboard LLM attempt {attempt}/{attempts} failed: {(response or 'empty')[:120]}"
+        )
 
     if not response or response.startswith("Error: "):
         raise HttpException(

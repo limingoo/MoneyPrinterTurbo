@@ -322,7 +322,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
             stopSubmit()
             toast(
               'error',
-              '分镜拆分失败（LLM 响应超时或配置问题）。已停止提交：请稍后重试，或在「画面」页签关闭分镜对齐后再生成。',
+              '分镜拆分失败（LLM 网关连续两次超时）。已停止提交：等 2~3 分钟再点生成（连点会被限流），或在「画面」页签关闭分镜对齐。',
             )
             return
           }
@@ -464,7 +464,7 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
         {submitting && (
           <span className="inline-flex items-center gap-1.5 text-xs text-muted">
             {submitPhase === 'storyboard'
-              ? '正在拆分镜…（免费 LLM 最慢约 2 分钟，请稍候）'
+              ? '正在拆分镜…（免费/共享 LLM 最慢约 3 分钟，含自动重试）'
               : submitPhase === 'match'
                 ? '正在匹配素材库画面…'
                 : '正在提交任务…'}

@@ -158,8 +158,8 @@ def _call_chat_completions(endpoint: str, api_key: str, model: str, prompt: str)
         api_key=api_key,
         base_url=endpoint,
         default_headers=request_headers(),
-        timeout=120,
-        max_retries=1,
+        timeout=100,
+        max_retries=0,
     ) as client:
         response = client.chat.completions.create(
             model=model,
