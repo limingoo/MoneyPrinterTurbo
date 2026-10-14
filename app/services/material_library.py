@@ -691,8 +691,20 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                 if is_image:
                     shutil.copy2(original, tmp_seg)
                 else:
-                    start_s, end_s = (0.0, min(duration, _SEGMENT_MAX_SECONDS)) if span is None or "|" not in span \
-                        else (float(span.split("|")[0]), float(span.split("|")[1]))
+                    # span 有两种形态：不分段时是 float 时长（见上方
+                    # pieces = [(None, duration)]），按场景切分时是
+                    # "start|end" 字符串。原判断写成 `span is None or
+                    # "|" not in span`，对 float 求成员关系会抛
+                    # TypeError，导致所有 22 秒以内的视频整条入库直接失败
+                    # （没分段、没体检、更没打标）。这里按类型分派。
+                    if isinstance(span, str) and "|" in span:
+                        start_s, end_s = (
+                            float(span.split("|")[0]),
+                            float(span.split("|")[1]),
+                        )
+                    else:
+                        duration_hint = span if isinstance(span, (int, float)) else duration
+                        start_s, end_s = (0.0, min(duration_hint, _SEGMENT_MAX_SECONDS))
                     take = max(0.8, min(_SEGMENT_MAX_SECONDS, end_s - start_s))
                     normalized = (
                         f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
