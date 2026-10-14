@@ -328,6 +328,51 @@ def _stage_progress_reporter(task_id: str, stage_start: float, stage_end: float)
     return report
 
 
+# 流水线阶段词表。前端据此渲染步骤条，"进行到哪一步" 不再需要反推 progress
+# 刻度；取值与 _mark_task_failed 使用的 failed_stage 保持一致，前端可以拿
+# 同一个词表渲染正常进度和失败断点。
+STAGE_PREFLIGHT = "preflight"
+STAGE_SCRIPT = "script"
+STAGE_TERMS = "terms"
+STAGE_AUDIO = "audio"
+STAGE_SUBTITLE = "subtitle"
+STAGE_MATERIALS = "materials"
+STAGE_VIDEO = "video"
+
+PIPELINE_STAGES = (
+    STAGE_PREFLIGHT,
+    STAGE_SCRIPT,
+    STAGE_TERMS,
+    STAGE_AUDIO,
+    STAGE_SUBTITLE,
+    STAGE_MATERIALS,
+    STAGE_VIDEO,
+)
+
+
+def _mark_task_stage(task_id: str, stage: str, progress: int, **extra) -> None:
+    """记录流水线即将执行的阶段。
+
+    进度刻度仍按原有边界写入（前端另有插值需求），这里额外落一个阶段名，
+    让"生成中 43%"这种只有百分比的状态能直接告诉用户卡在哪一步。
+    阶段内后续的纯进度更新不会清除该字段：内存态是字典合并，Redis 是
+    HSET，两者都只覆盖传入的键。
+
+    progress 必须显式传入：update_task 的 progress 默认是 0，只传 kwargs
+    会把已推进的进度清零。
+    """
+
+    if stage not in PIPELINE_STAGES:
+        raise ValueError(f"unknown pipeline stage: {stage!r}")
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=progress,
+        stage=stage,
+        **extra,
+    )
+
+
 def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
@@ -1485,10 +1530,7 @@ def _run_pipeline(
     voxcpm_prompt_text: str = "",
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
-    sm.state.update_task(
-        task_id, state=const.TASK_STATE_PROCESSING, progress=5,
-        failed_stage=None, error=None,
-    )
+    _mark_task_stage(task_id, STAGE_PREFLIGHT, 5, failed_stage=None, error=None)
 
     if stop_at == "video" and params.subtitle_enabled:
         try:
@@ -1611,6 +1653,8 @@ def _run_pipeline(
             "in config.toml to a working ffmpeg executable",
         )
 
+    _mark_task_stage(task_id, STAGE_SCRIPT, 5)
+
     # 1. Generate script
     video_script = generate_script(task_id, params)
     # The LLM adapter uses a leading "Error: " as its failure sentinel. A
@@ -1629,7 +1673,7 @@ def _run_pipeline(
         )
         return _mark_task_failed(task_id, "script", error)
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+    _mark_task_stage(task_id, STAGE_TERMS, 10)
 
     if stop_at == "script":
         sm.state.update_task(
@@ -1656,7 +1700,7 @@ def _run_pipeline(
         )
         return {"script": video_script, "terms": video_terms}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
+    _mark_task_stage(task_id, STAGE_AUDIO, 20)
 
     # 3. Generate audio
     generate_audio_kwargs = {
@@ -1681,7 +1725,7 @@ def _run_pipeline(
             "failed to prepare narration audio",
         )
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
+    _mark_task_stage(task_id, STAGE_SUBTITLE, 30)
 
     if stop_at == "audio":
         # Full video jobs apply gain in the final mixer. Audio-only exports have
@@ -1732,7 +1776,7 @@ def _run_pipeline(
         )
         return {"subtitle_path": subtitle_path}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
+    _mark_task_stage(task_id, STAGE_MATERIALS, 40)
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
@@ -1758,7 +1802,7 @@ def _run_pipeline(
         )
         return {"materials": downloaded_videos}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
+    _mark_task_stage(task_id, STAGE_VIDEO, 50)
 
     # 仅完整视频生成流程才需要处理视频拼接模式；
     # 这样可以避免 /subtitle 和 /audio 这类请求访问不存在的字段。

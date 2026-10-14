@@ -78,6 +78,7 @@ export interface TaskStatus {
   task_id: string
   state: number
   progress: number
+  stage?: string
   videos?: string[]
   combined_videos?: string[]
   audio_file?: string

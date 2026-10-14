@@ -9,7 +9,7 @@ import {
   ChevronRight,
   Clock,
   CheckCircle2,
-  Music4,
+  Check,
   Captions,
   Camera,
   Play,
@@ -18,7 +18,6 @@ import {
 import {
   Button,
   Badge,
-  Progress,
   Modal,
   Spinner,
   useToast,
@@ -30,16 +29,136 @@ import { usePolling } from '../hooks'
 
 const PAGE_SIZE = 12
 
+/**
+ * 流水线阶段与后端 app/services/task.py 的 PIPELINE_STAGES 同源。
+ * 后端每个阶段边界都会写入 stage，所以这里直接读，不靠 progress 刻度反推
+ * ——进度刻度一旦调整，UI 不会跟着悄悄漂移。
+ */
+const PIPELINE_STAGES = [
+  { key: 'preflight', label: '环境预检' },
+  { key: 'script', label: '生成文案' },
+  { key: 'terms', label: '提取关键词' },
+  { key: 'audio', label: '生成配音' },
+  { key: 'subtitle', label: '生成字幕' },
+  { key: 'materials', label: '获取素材' },
+  { key: 'video', label: '合成视频' },
+] as const
+
+function stageLabel(stage?: string) {
+  return PIPELINE_STAGES.find((s) => s.key === stage)?.label
+}
+
+/** 失败可能发生在流水线之外（排队、调度），此时 stage 不是词表内的值。 */
+function stageIndex(task: TaskStatus) {
+  const current = task.stage ?? task.failed_stage
+  if (current) {
+    const found = PIPELINE_STAGES.findIndex((s) => s.key === current)
+    // 词表外的失败（webui_worker / scheduling）没有对应步骤，落在最后一步。
+    if (found >= 0) return found
+    return PIPELINE_STAGES.length - 1
+  }
+  // 历史任务没有 stage 字段，退回用进度刻度定位到大致阶段。
+  if (task.state === TASK_STATE.COMPLETE) return PIPELINE_STAGES.length
+  const p = task.progress ?? 0
+  if (p >= 50) return PIPELINE_STAGES.length - 1
+  if (p >= 40) return 5
+  if (p >= 30) return 4
+  if (p >= 20) return 3
+  if (p >= 10) return 2
+  if (p >= 5) return 1
+  return 0
+}
+
+/** 收起态用的一条细进度轨：在不展开的情况下也能看出走到第几步。 */
+function StageTrack({ task }: { task: TaskStatus }) {
+  const idx = stageIndex(task)
+  const done = task.state === TASK_STATE.COMPLETE
+  const failed = task.state === TASK_STATE.FAILED
+  const current = done ? -1 : failed ? -2 : idx
+
+  return (
+    <div
+      className="flex items-center gap-1"
+      title={PIPELINE_STAGES[idx]?.label ?? ''}
+    >
+      {PIPELINE_STAGES.map((s, i) => (
+        <span
+          key={s.key}
+          className={`h-1 flex-1 rounded-full transition-colors ${
+            current === -1 || i < idx
+              ? 'bg-success/70'
+              : current === -2 && i === idx
+                ? 'bg-danger'
+                : i === idx
+                  ? 'bg-brand'
+                  : 'bg-line'
+          }`}
+        />
+      ))}
+    </div>
+  )
+}
+
+function StageSteps({ task }: { task: TaskStatus }) {
+  const idx = stageIndex(task)
+  const failed = task.state === TASK_STATE.FAILED
+  const done = task.state === TASK_STATE.COMPLETE
+
+  return (
+    <ol className="space-y-1">
+      {PIPELINE_STAGES.map((s, i) => {
+        // 未命中的分支（如本地素材源不走 terms）保持中性色，不谎报状态。
+        const isPast = done || i < idx
+        const isCurrent = !done && i === idx
+        const isFailed = failed && i === idx
+        return (
+          <li
+            key={s.key}
+            className={`flex items-center gap-2 text-xs transition-colors ${
+              isCurrent || isFailed ? 'text-ink' : 'text-muted/70'
+            }`}
+          >
+            <span
+              className={`flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border text-[9px] ${
+                isFailed
+                  ? 'border-danger bg-danger/20 text-danger'
+                  : isCurrent
+                    ? 'border-brand bg-brand/20 text-brand'
+                    : isPast
+                      ? 'border-success/60 bg-success/15 text-success'
+                      : 'border-line'
+              }`}
+            >
+              {isFailed ? (
+                <X size={9} />
+              ) : isPast ? (
+                <Check size={9} />
+              ) : isCurrent ? (
+                <span className="h-1.5 w-1.5 rounded-full bg-brand animate-pulse-dot" />
+              ) : null}
+            </span>
+            <span className={isCurrent ? 'font-medium' : ''}>{s.label}</span>
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
 function stateBadge(task: TaskStatus) {
   if (task.state === TASK_STATE.COMPLETE)
     return <Badge tone="success">已完成</Badge>
   if (task.state === TASK_STATE.FAILED)
-    return <Badge tone="danger">失败{task.failed_stage ? ` · ${task.failed_stage}` : ''}</Badge>
+    return (
+      <Badge tone="danger">
+        失败{stageLabel(task.failed_stage) ? ` · ${stageLabel(task.failed_stage)}` : ''}
+      </Badge>
+    )
   if (task.state === TASK_STATE.PROCESSING)
     return (
       <Badge tone="brand">
         <span className="h-1.5 w-1.5 rounded-full bg-brand animate-pulse-dot" />
-        生成中 {task.progress ?? 0}%
+        {stageLabel(task.stage) ?? `生成中 ${task.progress ?? 0}%`}
       </Badge>
     )
   return <Badge tone="warn">排队中</Badge>
@@ -58,6 +177,8 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
   const [deleting, setDeleting] = useState<TaskStatus | null>(null)
+  // 展开详情的任务 id：列表形态下默认收起，点行才展开预览/产物。
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   // 拍摄任务清单：need.task_id → 该任务的素材缺口
   const [needs, setNeeds] = useState<ShootNeed[]>([])
@@ -241,144 +362,207 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
           </Button>
         </div>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {tasks.map((task) => (
-            <article
-              key={task.task_id}
-              className="group flex flex-col overflow-hidden rounded-2xl border border-line bg-panel/80 transition-all hover:border-brand/40 hover:shadow-lg hover:shadow-brand/5"
-            >
-              {/* 视频预览区 */}
-              <div className="relative aspect-video bg-black/40">
-                {task.state === TASK_STATE.COMPLETE && task.videos?.length ? (
-                  <video
-                    src={task.videos[0]}
-                    controls
-                    preload="metadata"
-                    className="h-full w-full object-contain"
-                  />
-                ) : task.state === TASK_STATE.COMPLETE ? (
-                  <div className="flex h-full flex-col items-center justify-center gap-2 text-muted">
-                    <CheckCircle2 size={32} className="text-success/70" />
-                    <span className="text-xs">任务完成（无视频产物）</span>
-                  </div>
-                ) : task.state === TASK_STATE.FAILED ? (
-                  <div className="flex h-full flex-col items-center justify-center gap-1.5 p-4 text-center">
-                    <Badge tone="danger">生成失败</Badge>
-                    <p className="line-clamp-3 text-xs text-muted">
-                      {task.error || '未知错误'}
-                    </p>
-                  </div>
-                ) : (
-                  <div className="flex h-full flex-col items-center justify-center gap-3 px-8">
-                    <Badge tone="brand">
-                      <span className="h-1.5 w-1.5 rounded-full bg-brand animate-pulse-dot" />
-                      {task.state === TASK_STATE.PROCESSING
-                        ? `生成中 ${task.progress ?? 0}%`
-                        : '排队等待中'}
-                    </Badge>
-                    <Progress value={task.progress ?? 0} />
-                  </div>
-                )}
-              </div>
-
-              {/* 信息区 */}
-              <div className="flex flex-1 flex-col gap-2.5 p-4">
-                <div className="flex items-start justify-between gap-2">
-                  <h3 className="line-clamp-1 text-sm font-semibold">
-                    {task.params?.video_subject || '未命名任务'}
-                  </h3>
-                  {stateBadge(task)}
-                </div>
-
-                <div className="flex items-center gap-3 text-xs text-muted">
-                  <span className="inline-flex items-center gap-1">
-                    <Clock size={12} />
-                    {fmtTime(task.created_at) || task.task_id.slice(0, 8)}
-                  </span>
-                  {task.params?.video_aspect && (
-                    <span>{task.params.video_aspect}</span>
-                  )}
-                  {task.params?.voice_name && task.params.voice_name !== 'no-voice' && (
-                    <span className="line-clamp-1">{task.params.voice_name}</span>
-                  )}
-                </div>
-
-                {task.videos && task.videos.length > 1 && (
-                  <p className="text-xs text-muted">
-                    共生成 {task.videos.length} 个视频
-                  </p>
-                )}
-
-                {openNeeds(task.task_id).length > 0 && (
+        <div className="space-y-2">
+          {tasks.map((task) => {
+            const expanded = expandedId === task.task_id
+            const needs = openNeeds(task.task_id)
+            const active =
+              task.state === TASK_STATE.PROCESSING ||
+              (task.state !== TASK_STATE.COMPLETE &&
+                task.state !== TASK_STATE.FAILED)
+            return (
+              <article
+                key={task.task_id}
+                className="overflow-hidden rounded-xl border border-line bg-panel/70 transition-colors hover:border-brand/40"
+              >
+                {/* 收起行：缩略图 + 主题/元信息 + 状态 + 操作 */}
+                <div className="flex items-center gap-3 p-3">
                   <button
                     type="button"
-                    onClick={() => setNeedsFor(task)}
-                    className="flex items-center gap-1.5 self-start rounded-lg border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-xs font-medium text-warn transition-colors hover:bg-warn/20"
+                    onClick={() =>
+                      setExpandedId(expanded ? null : task.task_id)
+                    }
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left"
                   >
-                    <Camera size={13} />
-                    待拍摄 {openNeeds(task.task_id).length} 项 · 查看拍摄简报
-                  </button>
-                )}
+                    <span className="relative h-11 w-[4.5rem] shrink-0 overflow-hidden rounded-lg bg-black/40">
+                      {task.state === TASK_STATE.COMPLETE &&
+                      task.videos?.length ? (
+                        <video
+                          src={task.videos[0]}
+                          preload="metadata"
+                          muted
+                          className="h-full w-full object-cover"
+                        />
+                      ) : task.state === TASK_STATE.FAILED ? (
+                        <span className="flex h-full items-center justify-center text-danger/70">
+                          <X size={18} />
+                        </span>
+                      ) : task.state === TASK_STATE.COMPLETE ? (
+                        <span className="flex h-full items-center justify-center text-success/70">
+                          <CheckCircle2 size={18} />
+                        </span>
+                      ) : active ? (
+                        <span className="flex h-full items-center justify-center">
+                          <span className="h-2 w-2 rounded-full bg-brand animate-pulse-dot" />
+                        </span>
+                      ) : null}
+                    </span>
 
-                {/* 配音 / 字幕产物 */}
-                {(task.audio_file || task.subtitle_path) && (
-                  <div className="space-y-2 rounded-xl border border-line bg-panel2 p-2.5">
-                    {task.audio_file && (
-                      <audio
-                        src={task.audio_file}
-                        controls
-                        preload="none"
-                        className="h-9 w-full"
-                      />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium text-ink">
+                          {task.params?.video_subject || '未命名任务'}
+                        </span>
+                        {stateBadge(task)}
+                      </span>
+                      <span className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted">
+                        <span className="inline-flex items-center gap-1">
+                          <Clock size={11} />
+                          {fmtTime(task.created_at) ||
+                            task.task_id.slice(0, 8)}
+                        </span>
+                        {task.params?.video_aspect && (
+                          <span>{task.params.video_aspect}</span>
+                        )}
+                        {task.params?.voice_name &&
+                          task.params.voice_name !== 'no-voice' && (
+                            <span className="truncate">
+                              {task.params.voice_name}
+                            </span>
+                          )}
+                        {task.videos && task.videos.length > 1 && (
+                          <span>{task.videos.length} 个视频</span>
+                        )}
+                      </span>
+                      {active && (
+                        <span className="mt-1.5 block">
+                          <StageTrack task={task} />
+                        </span>
+                      )}
+                    </span>
+                  </button>
+
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {needs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setNeedsFor(task)}
+                        title="查看拍摄简报"
+                        className="inline-flex h-8 items-center gap-1 rounded-lg border border-warn/40 bg-warn/10 px-2 text-xs font-medium text-warn transition-colors hover:bg-warn/20"
+                      >
+                        <Camera size={13} />
+                        {needs.length}
+                      </button>
                     )}
-                    <div className="flex gap-2">
-                      {task.audio_file && (
-                        <a
-                          href={task.audio_file}
-                          download
-                          className="inline-flex items-center gap-1 text-xs text-muted transition-colors hover:text-brand"
-                        >
-                          <Music4 size={12} />
-                          配音文件
-                        </a>
-                      )}
-                      {task.subtitle_path && (
-                        <a
-                          href={task.subtitle_path}
-                          download
-                          className="inline-flex items-center gap-1 text-xs text-muted transition-colors hover:text-brand"
-                        >
-                          <Captions size={12} />
-                          字幕文件
-                        </a>
-                      )}
-                    </div>
+                    {task.videos?.slice(0, 1).map((v) => (
+                      <a
+                        key={v}
+                        href={v}
+                        download
+                        title="下载视频"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-panel2 text-ink transition-colors hover:border-brand/50 hover:text-brand"
+                      >
+                        <Download size={13} />
+                      </a>
+                    ))}
+                    <Button
+                      variant="danger"
+                      className="h-8 w-8 px-0"
+                      title="删除任务"
+                      onClick={() => setDeleting(task)}
+                    >
+                      <Trash2 size={13} />
+                    </Button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setExpandedId(expanded ? null : task.task_id)
+                      }
+                      title={expanded ? '收起' : '展开详情'}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted transition-colors hover:text-brand"
+                    >
+                      <ChevronRight
+                        size={15}
+                        className={`transition-transform ${expanded ? 'rotate-90' : ''}`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                {/* 展开区：预览、阶段明细、产物 */}
+                {expanded && (
+                  <div className="space-y-3 border-t border-line/70 bg-panel2/30 p-3">
+                    {task.state === TASK_STATE.COMPLETE &&
+                      task.videos?.length ? (
+                      <video
+                        src={task.videos[0]}
+                        controls
+                        preload="metadata"
+                        className="max-h-[45vh] w-full rounded-lg bg-black/40 object-contain"
+                      />
+                    ) : null}
+
+                    {task.state === TASK_STATE.FAILED && task.error && (
+                      <p className="rounded-lg border border-danger/30 bg-danger/10 p-2.5 text-xs text-danger">
+                        {task.error}
+                      </p>
+                    )}
+
+                    {active && (
+                      <div className="flex gap-4">
+                        <div className="w-40 shrink-0">
+                          <p className="mb-1.5 text-[11px] font-medium text-muted">
+                            流水线阶段
+                          </p>
+                          <StageSteps task={task} />
+                        </div>
+                        {task.audio_file && (
+                          <div className="min-w-0 flex-1">
+                            <p className="mb-1.5 text-[11px] font-medium text-muted">
+                              配音
+                            </p>
+                            <audio
+                              src={task.audio_file}
+                              controls
+                              preload="none"
+                              className="h-9 w-full"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {task.subtitle_path && (
+                      <a
+                        href={task.subtitle_path}
+                        download
+                        className="inline-flex items-center gap-1 text-xs text-muted transition-colors hover:text-brand"
+                      >
+                        <Captions size={12} />
+                        字幕文件
+                      </a>
+                    )}
+
+                    {task.videos && task.videos.length > 0 && (
+                      <div className="flex flex-wrap gap-2">
+                        {task.videos.map((v, i) => (
+                          <a
+                            key={v}
+                            href={v}
+                            download
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-panel px-3 text-xs font-medium text-ink transition-colors hover:border-brand/50 hover:text-brand"
+                          >
+                            <Download size={13} />
+                            下载{i > 0 ? ` ${i + 1}` : ''}
+                          </a>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
-
-                <div className="mt-auto flex gap-2 pt-1">
-                  {task.videos?.map((v, i) => (
-                    <a
-                      key={v}
-                      href={v}
-                      download
-                      className="inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-line bg-panel2 text-xs font-medium text-ink transition-colors hover:border-brand/50 hover:text-brand"
-                    >
-                      <Download size={13} />
-                      下载{i > 0 ? ` ${i + 1}` : ''}
-                    </a>
-                  ))}
-                  <Button
-                    variant="danger"
-                    className="h-8 rounded-lg px-2.5 text-xs"
-                    onClick={() => setDeleting(task)}
-                  >
-                    <Trash2 size={13} />
-                  </Button>
-                </div>
-              </div>
-            </article>
-          ))}
+              </article>
+            )
+          })}
         </div>
       )}
 
