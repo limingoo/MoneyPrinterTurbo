@@ -392,16 +392,22 @@ def _normalize_box(width: int, height: int) -> tuple[int, int]:
 _GRAY_SIZE = 96
 
 
-def _sample_gray_frames(path: Path, out_frames: list) -> None:
+def _sample_gray_frames(path: Path, out_frames: list, is_image: bool = False) -> None:
     # 灰度帧是二进制数据，必须按字节捕获（text 模式会把 stdout 解码成 None）。
+    # 静态图片没有时间轴，fps 滤镜会丢弃唯一一帧，必须绕开 fps 只取 1 帧。
+    vf = (
+        f"scale={_GRAY_SIZE}:{_GRAY_SIZE},format=gray"
+        if is_image
+        else f"fps=2,scale={_GRAY_SIZE}:{_GRAY_SIZE},format=gray"
+    )
     run = subprocess.run(
         [
             _ffmpeg_exe(),
             "-hide_banner",
             "-loglevel", "error",
             "-i", str(path),
-            "-vf", f"fps=2,scale={_GRAY_SIZE}:{_GRAY_SIZE},format=gray",
-            "-frames:v", "48",
+            "-vf", vf,
+            "-frames:v", "1" if is_image else "48",
             "-f", "rawvideo",
             "-",
         ],
@@ -457,10 +463,11 @@ def _tech_metrics(frames: list[bytes]) -> dict:
     }
 
 
-def _tech_verdict(metrics: dict) -> tuple[str, str]:
+def _tech_verdict(metrics: dict, is_image: bool = False) -> tuple[str, str]:
     if metrics["mean_luma"] < _LUMA_BLACK:
         return "reject", "画面几乎全黑"
-    if 0 <= metrics["motion"] < _MOTION_FROZEN:
+    # 静态图片没有运动量，冻结帧判定只对视频有意义。
+    if not is_image and 0 <= metrics["motion"] < _MOTION_FROZEN:
         return "reject", "画面静止（疑似冻结或屏幕翻拍）"
     if 0 <= metrics["mean_luma"] < _LUMA_DARK_WARN:
         return "low_quality", "画面偏暗，建议补光重拍"
@@ -628,11 +635,12 @@ def _cleanup_jobs() -> None:
             _JOBS.pop(jid, None)
 
 
-def _staggered_name(filename: str, index: int) -> str:
+def _staggered_name(filename: str, index: int, is_image: bool = False) -> str:
     """段文件名保持与原素材同前缀，便于用户追溯来源。"""
 
     stem = Path(filename).stem
-    suffix = ".mp4"
+    # 视频统一转码为 mp4；图片保持原后缀，避免把 jpg 内容写成 .mp4。
+    suffix = Path(filename).suffix.lower() if is_image else ".mp4"
     return f"{stem}-seg{index:02d}{suffix}"
 
 
@@ -674,8 +682,8 @@ def _ingest_worker(job_id: str, filename: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             for index, (_, span) in enumerate(pieces, 1):
-                seg_name = _staggered_name(filename, index)
                 is_image = kind == "image"
+                seg_name = _staggered_name(filename, index, is_image)
                 tmp_seg = tmp_path / (
                     f"work{index}{Path(filename).suffix.lower() if is_image else '.mp4'}"
                 )
@@ -716,9 +724,9 @@ def _ingest_worker(job_id: str, filename: str) -> None:
 
                 # --- 技术体检 ---
                 frames: list[bytes] = []
-                _sample_gray_frames(tmp_seg, frames)
+                _sample_gray_frames(tmp_seg, frames, is_image)
                 metrics = _tech_metrics(frames)
-                tech_status, tech_reason = _tech_verdict(metrics)
+                tech_status, tech_reason = _tech_verdict(metrics, is_image)
                 hashes = [_dhash(f) for f in frames[:: max(1, len(frames) // 3)][:3]]
 
                 # --- 查重 ---
@@ -835,8 +843,10 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                         sorted(set(tags))[:6], tags_en[:6], seg_name
                     )
 
-        # 处理完成的原始文件移入 .trash 留底，库目录只保留拆好的段
-        if original and original.is_file() and counts["accepted"] + counts["skipped"] > 0:
+        # 处理完成的原始文件移入 .trash 留底，库目录只保留拆好的段。
+        # low_quality 段同样已入库，其原始文件也要移走，否则库里残留未打标的副本。
+        kept = counts["accepted"] + counts["skipped"] + counts["low_quality"]
+        if original and original.is_file() and kept > 0:
             shutil.move(str(original), str(Path(_trash_dir()) / filename))
 
         _add_event(job_id, {"type": "summary", **counts})
