@@ -5,6 +5,7 @@ import io
 import math
 import os
 import random
+import re
 import gc
 import subprocess
 import sys
@@ -88,6 +89,26 @@ _MIN_DIMENSION_TOLERANCE = 10
 # 默认串行处理片段，避免旧用户升级后 CPU 和内存占用突然增加。
 # 需要加速时可自行提高并发数，但每路都会启动独立的编码任务。
 _CLIP_PROCESSING_CONCURRENCY = 1
+
+# --- 切片对齐镜头边界 ---
+# 原来成片阶段按固定步长从第 0 秒开始等分，切点完全不看画面内容，容易出现
+# 「前 2 秒是产品特写、后 3 秒硬切到另一个场景」的跨镜头片段。这里先用 ffmpeg
+# 探测每条素材的场景切换点，再把每个切点吸附到最近的镜头边界。
+_SCENE_ALIGN_ENABLED = True
+_SCENE_DETECT_THRESHOLD = 0.30
+# 切点允许偏离目标步长多少秒。太紧则几乎吸附不上（等于白跑一次 ffmpeg），
+# 太松则片段长短失衡。默认按目标步长的 35% 取。
+_SCENE_ALIGN_TOLERANCE_RATIO = 0.35
+# 吸附后每段仍需达到的最短时长，避免产生无意义的碎片。
+_SCENE_ALIGN_MIN_SECONDS = 0.8
+# 场景探测是纯解码 + 丢帧到 null，理论上很快；超时按“无边界”处理。
+_SCENE_PROBE_TIMEOUT_SECONDS = 60
+# 探测的并发单独给一个上限：它比后续 MoviePy 转码轻得多，但毕竟是解码，
+# 不适合跟着 video_clip_concurrency（默认 1，为编码省资源）一起被压成串行。
+_SCENE_PROBE_CONCURRENCY = 4
+# 同一份素材在一次成片里可能被反复使用（多片段、video_count>1、重试），
+# 探测结果只跟文件内容有关，按 路径+大小+mtime 缓存，避免重复解码。
+_SCENE_PROBE_CACHE_SIZE = 256
 
 
 def _get_clip_processing_concurrency() -> int:
@@ -224,6 +245,133 @@ def is_material_resolution_acceptable(width: int, height: int) -> bool:
     """
     min_dimension = _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
     return width >= min_dimension and height >= min_dimension
+
+
+def _detect_scene_boundaries_uncached(path: str) -> List[float]:
+    """探测一条素材的镜头切换时间点（秒），失败时返回空列表。
+
+    用 ffmpeg 的 scene 滤镜配合 showinfo 把切换点的 pts_time 打到 stderr，
+    不落盘、不重编码。空列表表示“没有可用边界”，调用方会退回固定步长等分，
+    因此任何异常都必须被吞掉——切片对齐只是锦上添花，不能让它拖垮出片。
+    """
+
+    try:
+        completed = subprocess.run(
+            [
+                utils.get_ffmpeg_binary(),
+                "-hide_banner",
+                "-nostdin",
+                "-i", path,
+                "-vf",
+                f"select='gt(scene,{_SCENE_DETECT_THRESHOLD})',showinfo",
+                "-fps_mode", "vfr",
+                "-an",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_SCENE_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning(f"scene probe skipped: path={os.path.basename(path)}, error={exc}")
+        return []
+
+    if completed.returncode != 0:
+        return []
+
+    times: set[float] = set()
+    for raw in re.findall(r"pts_time:([\d.]+)", completed.stderr or ""):
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            times.add(round(value, 2))
+    return sorted(times)
+
+
+def _scene_probe_cache_key(path: str) -> tuple:
+    """探测结果只跟文件内容有关，用 路径+大小+mtime 判定是否失效。"""
+
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return (path, -1, -1)
+    return (path, stat.st_size, int(stat.st_mtime))
+
+
+@lru_cache(maxsize=_SCENE_PROBE_CACHE_SIZE)
+def _detect_scene_boundaries_cached(key: tuple) -> tuple:
+    return tuple(_detect_scene_boundaries_uncached(key[0]))
+
+
+def _detect_scene_boundaries(path: str) -> List[float]:
+    """带缓存的镜头边界探测。文件被替换后缓存自动失效。"""
+
+    return list(_detect_scene_boundaries_cached(_scene_probe_cache_key(path)))
+
+
+def _scene_aligned_spans(
+    duration: float, boundaries: List[float], target: float
+) -> List[tuple[float, float]]:
+    """按 target 秒长切分 duration，但把切点吸附到最近的镜头边界。
+
+    目标切点为 ``start + target``，在容差内寻找最近的场景切换点；找不到就用
+    目标切点，因此输出覆盖的时间范围与等分切完全一致，总时长不会被缩短。
+    吸附后仍强制每段不短于 ``_SCENE_ALIGN_MIN_SECONDS``，避免出现碎片。
+    """
+
+    if not boundaries or target <= 0:
+        return []
+
+    # 整条素材还不足一个片段时没有切点可吸附，直接整条返回。
+    if duration <= target:
+        return [(0.0, duration)]
+
+    tolerance = max(0.25, target * _SCENE_ALIGN_TOLERANCE_RATIO)
+    spans: List[tuple[float, float]] = []
+    start = 0.0
+    # boundaries 已排序，用游标线性推进，避免每段都从头扫描。
+    cursor = 0
+    while start < duration:
+        ideal = start + target
+        if ideal >= duration:
+            break
+
+        chosen = ideal
+        # 在容差内找最接近 ideal 的边界；游标只需前进到超出容差为止。
+        best_delta = None
+        probe = cursor
+        while probe < len(boundaries) and boundaries[probe] < ideal - tolerance:
+            probe += 1
+        for candidate in boundaries[max(probe - 1, 0) : probe + 1]:
+            delta = abs(candidate - ideal)
+            if delta > tolerance:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                chosen = candidate
+        cursor = probe
+
+        end = min(chosen, duration)
+        if end - start < _SCENE_ALIGN_MIN_SECONDS:
+            # 吸附点太近，等同于没吸附，保留理想切点避免碎片。
+            end = min(ideal, duration)
+        if end <= start:
+            break
+        spans.append((start, end))
+        start = end
+
+    if not spans:
+        return []
+    if start < duration:
+        # 末段不足最短时长时并入上一段，保证覆盖到片尾。
+        if duration - spans[-1][0] < _SCENE_ALIGN_MIN_SECONDS:
+            spans[-1] = (spans[-1][0], duration)
+        else:
+            spans.append((start, duration))
+    return spans
 
 
 def _prioritize_unique_source_clips(
@@ -1008,6 +1156,36 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
+
+    # 先探测每条素材的镜头边界，再按边界吸附切分。探测放在切分之前是为了
+    # 并发跑完 ffmpeg（纯解码，耗时远低于后续 MoviePy 转码）；任一条失败
+    # 都只会让该素材退回等分，不影响其他素材。
+    scene_boundaries: dict[str, List[float]] = {}
+    if _SCENE_ALIGN_ENABLED and video_concat_mode.value != VideoConcatMode.sequential.value:
+        unique_paths = list(dict.fromkeys(video_paths))
+        try:
+            probe_concurrency = int(
+                config.app.get("video_scene_probe_concurrency", _SCENE_PROBE_CONCURRENCY)
+            )
+        except (TypeError, ValueError):
+            probe_concurrency = _SCENE_PROBE_CONCURRENCY
+        workers = max(1, min(probe_concurrency, len(unique_paths)))
+        if workers > 1 and len(unique_paths) > 1:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="scene-probe"
+            ) as probe_pool:
+                detected = list(
+                    probe_pool.map(_detect_scene_boundaries, unique_paths)
+                )
+        else:
+            detected = [_detect_scene_boundaries(p) for p in unique_paths]
+        scene_boundaries = dict(zip(unique_paths, detected))
+        aligned = sum(1 for v in scene_boundaries.values() if v)
+        logger.info(
+            f"scene-aligned slicing: {aligned}/{len(scene_boundaries)} sources "
+            f"have detectable shot boundaries"
+        )
+
     for video_path in video_paths:
         clip = None
         try:
@@ -1030,7 +1208,31 @@ def combine_videos(
             continue
         finally:
             close_clip(clip)
-        
+
+        # 切点吸附到镜头边界；探测不到时 spans 为空，退回固定步长等分。
+        aligned_spans = _scene_aligned_spans(
+            clip_duration,
+            scene_boundaries.get(video_path) or [],
+            source_clip_duration,
+        )
+
+        if aligned_spans:
+            for start_time, end_time in aligned_spans:
+                if end_time > start_time:
+                    subclipped_items.append(
+                        SubClippedVideoClip(
+                            file_path=video_path,
+                            start_time=start_time,
+                            end_time=end_time,
+                            width=clip_w,
+                            height=clip_h,
+                            source_file_path=video_path,
+                        )
+                    )
+            if video_concat_mode.value == VideoConcatMode.sequential.value:
+                break
+            continue
+
         start_time = 0
 
         while start_time < clip_duration:
