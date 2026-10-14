@@ -440,7 +440,7 @@ export function SettingsPage({
                       onChange={(e) => setCloneText(e.target.value)}
                     />
                   </Field>
-                  <Field label="音频文件" hint="wav/mp3 ≤8MB，安静环境录制">
+                  <Field label="音频文件" hint="wav/mp3 ≤8MB（m4a/aac 会自动转码），安静环境录制">
                     <div className="flex gap-2">
                       <label className="flex-1">
                         <input

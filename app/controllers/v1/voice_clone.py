@@ -11,6 +11,9 @@ TTS 分发时解析回 URI），从而出现在前端"我的克隆声音"分组�
 该模块只新增端点，上游文件仅 router.py 注册两行。
 """
 
+import os
+import subprocess
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +41,22 @@ _SILICONFLOW_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
 _MAX_AUDIO_BYTES = 8 * 1024 * 1024  # SiliconFlow 音色样本上限
 _ALLOWED_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac")
 _UPLOAD_TIMEOUT_SECONDS = 120
+_TRANSCODE_TIMEOUT_SECONDS = 120
+
+# SiliconFlow 上游只认 wav/mp3/pcm/opus。前端文件选择器是 audio/*，手机
+# （尤其是 iPhone）录出来的是 .m4a，本地白名单放行后会被上游以
+# "Only wav/mp3/pcm/opus are supported" 400 拒绝。与其让用户手动转格式，
+# 不如在上传前用 ffmpeg 转成上游必定接受的 mp3。
+_UPSTREAM_NATIVE_EXTENSIONS = (".mp3", ".wav")
+_TRANSCODE_TARGET_SUFFIX = ".mp3"
+# 16k 单声道是音色复刻的常规输入规格，体积也远小于原始 m4a。
+_TRANSCODE_AUDIO_ARGS = (
+    "-vn",
+    "-ac", "1",
+    "-ar", "16000",
+    "-c:a", "libmp3lame",
+    "-b:a", "64k",
+)
 
 
 class ClonedVoiceEntry(BaseModel):
@@ -85,6 +104,92 @@ def _get_siliconflow_key(request_id: str) -> str:
             ),
         )
     return api_key
+
+
+def _transcode_to_accepted_format(payload: bytes, suffix: str, request_id: str):
+    """把上游不接受的音频转成 mp3，返回 ``(文件名, 字节)``。
+
+    上传流在内存里，ffmpeg 需要真实文件才能读取，因此借临时文件中转；
+    成功和失败都在 finally 里删除，不会留下残留。
+    """
+
+    descriptor, source_path = tempfile.mkstemp(
+        prefix="voice-clone-src-", suffix=suffix or ".bin"
+    )
+    descriptor2, target_path = tempfile.mkstemp(
+        prefix="voice-clone-out-", suffix=_TRANSCODE_TARGET_SUFFIX
+    )
+    os.close(descriptor)
+    os.close(descriptor2)
+    try:
+        with open(source_path, "wb") as handle:
+            handle.write(payload)
+
+        command = [
+            utils.get_ffmpeg_binary(),
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            source_path,
+            *_TRANSCODE_AUDIO_ARGS,
+            target_path,
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=_TRANSCODE_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", "replace").strip()[:200]
+            logger.warning(
+                f"voice clone transcode failed: request_id={request_id}, "
+                f"suffix={suffix!r}, returncode={completed.returncode}"
+            )
+            raise HttpException(
+                task_id=request_id,
+                status_code=400,
+                message=(
+                    f"{request_id}: 无法转换 {suffix or '该'} 音频为上游支持的格式"
+                    f"（ffmpeg 退出码 {completed.returncode}）{detail}"
+                    "；请改用 wav 或 mp3 文件"
+                ),
+            )
+
+        with open(target_path, "rb") as handle:
+            converted = handle.read()
+        if not converted:
+            raise HttpException(
+                task_id=request_id,
+                status_code=400,
+                message=f"{request_id}: 音频转换为 mp3 后为空，请更换文件",
+            )
+        if len(converted) > _MAX_AUDIO_BYTES:
+            raise HttpException(
+                task_id=request_id,
+                status_code=400,
+                message=f"{request_id}: 转换后的音频超过 8MB 上限，请裁剪到 10-30 秒",
+            )
+
+        logger.info(
+            f"voice clone transcoded {suffix or 'unknown'} -> mp3: "
+            f"request_id={request_id}, {len(payload)} -> {len(converted)} bytes"
+        )
+        stem = Path(target_path).stem
+        return f"{stem}{_TRANSCODE_TARGET_SUFFIX}", converted
+    except subprocess.TimeoutExpired as exc:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: 音频转换超时，请裁剪到 10-30 秒后重试",
+        ) from exc
+    finally:
+        for path in (source_path, target_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 @router.post(
@@ -137,6 +242,11 @@ async def clone_voice(
             message=f"{request_id}: 请提供音频对应的文字（内容必须与录音逐字一致）",
         )
 
+    # 本地白名单与上游支持格式不一致的格式（.m4a/.aac）在这里先转成 mp3，
+    # 避免把必然被上游 400 拒绝的字节发出去。
+    if suffix not in _UPSTREAM_NATIVE_EXTENSIONS:
+        filename, payload = _transcode_to_accepted_format(payload, suffix, request_id)
+
     custom_name = _sanitize_custom_name(name, request_id)
     display_name = (name or "").strip() or custom_name
 
@@ -171,7 +281,7 @@ async def clone_voice(
             detail = response.text[:200]
         logger.warning(
             f"voice clone rejected: request_id={request_id}, "
-            f"status={response.status_code}"
+            f"status={response.status_code}, detail={detail!r}"
         )
         raise HttpException(
             task_id=request_id,
