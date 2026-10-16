@@ -55,6 +55,7 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        target_duration=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -62,6 +63,9 @@ class SubClippedVideoClip:
         self.width = width
         self.height = height
         self.source_file_path = source_file_path or file_path
+        # 分镜对齐计划里，每个片段在成片中的目标时长（秒）。为空时退回到
+        # combine_videos 的 max_clip_duration 兜底。
+        self.target_duration = target_duration
         if duration is None:
             self.duration = end_time - start_time
         else:
@@ -1100,6 +1104,61 @@ def _fit_clip_to_canvas(
     ).with_duration(clip.duration)
 
 
+def _clip_plan_items(
+    clip_plan: List[dict], video_paths: List[str]
+) -> List[SubClippedVideoClip]:
+    """把分镜对齐计划转成待处理片段；同一素材只探测一次尺寸。"""
+
+    size_cache: dict[str, tuple[float, int, int]] = {}
+    items: List[SubClippedVideoClip] = []
+    for entry in clip_plan:
+        if not isinstance(entry, dict):
+            continue
+        file_path = str(entry.get("file_path") or "")
+        start_time = float(entry.get("start_time") or 0.0)
+        end_time = float(entry.get("end_time") or 0.0)
+        target = entry.get("target_duration")
+        if not file_path or end_time <= start_time:
+            continue
+        if file_path not in size_cache:
+            clip = None
+            try:
+                clip = _open_video_clip_quietly(file_path)
+                size_cache[file_path] = (
+                    float(clip.duration),
+                    clip.size[0],
+                    clip.size[1],
+                )
+            except Exception as exc:  # noqa: BLE001 - 单条坏素材不应中断合成
+                logger.warning(f"clip plan source unreadable: {file_path}, error={exc}")
+                size_cache[file_path] = (0.0, 0, 0)
+            finally:
+                close_clip(clip)
+        duration, clip_w, clip_h = size_cache[file_path]
+        if duration <= 0:
+            continue
+        start_time = max(0.0, min(start_time, max(0.0, duration - 0.05)))
+        end_time = max(start_time + 0.05, min(end_time, duration))
+        items.append(
+            SubClippedVideoClip(
+                file_path=file_path,
+                start_time=start_time,
+                end_time=end_time,
+                width=clip_w,
+                height=clip_h,
+                source_file_path=file_path,
+                target_duration=float(target) if target else None,
+            )
+        )
+    logger.info(
+        f"clip plan: {len(items)}/{len(clip_plan)} planned clips usable "
+        f"across {len(size_cache)} sources"
+    )
+    if not items and video_paths:
+        logger.warning("clip plan produced no usable clips, falling back to fixed slicing")
+    return items
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -1115,6 +1174,7 @@ def combine_videos(
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    clip_plan: List[dict] | None = None,
 ) -> str:
     # Pydantic leaves this optional default as the string "random" unless
     # explicitly provided. Normalize it once for all downstream enum access.
@@ -1186,7 +1246,11 @@ def combine_videos(
             f"have detectable shot boundaries"
         )
 
-    for video_path in video_paths:
+    # 分镜对齐计划已经给出「哪个镜头用哪条素材的哪一段、播多久」，此时既不需要
+    # 场景边界探测，也不能再做去重重排——顺序本身就是语义。
+    planned_items = _clip_plan_items(clip_plan, video_paths) if clip_plan else []
+
+    for video_path in (() if planned_items else video_paths):
         clip = None
         try:
             clip = _open_video_clip_quietly(video_path)
@@ -1257,13 +1321,16 @@ def combine_videos(
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
 
-    subclipped_items = _prioritize_unique_source_clips(
-        subclipped_items=subclipped_items,
-        concat_mode=video_concat_mode,
-        **({"source_usage": source_usage, "source_groups": source_groups}
-           if source_usage is not None else {}),
-    )
-        
+    subclipped_items = planned_items or subclipped_items
+
+    if not planned_items:
+        subclipped_items = _prioritize_unique_source_clips(
+            subclipped_items=subclipped_items,
+            concat_mode=video_concat_mode,
+            **({"source_usage": source_usage, "source_groups": source_groups}
+               if source_usage is not None else {}),
+        )
+
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
     
     # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
@@ -1335,8 +1402,11 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
+            # 分镜计划给出目标时长时按计划裁剪（旁白念到哪、画面就播到哪）；
+            # 其余情况仍以 max_clip_duration 兜底，避免片段突破配置上限。
+            clip_limit = subclipped_item.target_duration or max_clip_duration
+            if clip.duration > clip_limit:
+                clip = clip.subclipped(0, clip_limit)
 
             # Write each candidate clip to a unique temporary file. Threads must not
             # share the same output path.
@@ -1400,7 +1470,7 @@ def combine_videos(
                 subclipped_item = subclipped_items[candidate_index]
                 source_duration = subclipped_item.end_time - subclipped_item.start_time
                 output_duration = min(
-                    max_clip_duration,
+                    subclipped_item.target_duration or max_clip_duration,
                     source_duration / normalized_clip_speed,
                 )
                 batch.append((candidate_index, subclipped_item))
@@ -1436,11 +1506,19 @@ def combine_videos(
                 break
             processed_clips.append(clip)
             video_duration += clip.duration
+        recycled_clips = len(processed_clips) - len(base_clips)
         logger.info(
             f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
             f"required duration: {required_video_duration:.2f}s, "
-            f"looped {len(processed_clips)-len(base_clips)} clips"
+            f"looped {recycled_clips} clips"
         )
+        if recycled_clips:
+            logger.warning(
+                f"素材总时长不足：{len(base_clips)} 条素材只能覆盖 "
+                f"{sum(clip.duration for clip in base_clips):.1f}s，成片需 "
+                f"{required_video_duration:.1f}s，已循环复用 {recycled_clips} 次。"
+                "补更多素材可以消除重复画面。"
+            )
      
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
@@ -2088,10 +2166,13 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
             # The duration changes the rendered content, so it must be part of
             # the output identity. Different tasks may render the same image
             # concurrently; only publish a complete MP4 after MoviePy closes it.
-            source_identity = hashlib.sha256(os.fsencode(os.path.abspath(image_path))).hexdigest()
+            # 保留原素材文件名（<原名>.zoom-<hash>.mp4）：分镜对齐需要把渲染片段
+            # 映射回库内原始素材（标签、时长都挂在原名上），sha256 命名无法反查。
+            source_stem = os.path.splitext(os.path.basename(image_path))[0]
             duration_identity = hashlib.sha256(str(clip_duration).encode()).hexdigest()[:16]
             video_file = os.path.join(
-                os.path.dirname(image_path), f"{source_identity}.zoom-{duration_identity}.mp4"
+                os.path.dirname(image_path),
+                f"{source_stem}.zoom-{duration_identity}.mp4",
             )
             descriptor, temp_path = tempfile.mkstemp(
                 prefix=".image-zoom-",

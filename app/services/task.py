@@ -22,10 +22,13 @@ from app.services import (
     llm,
     loomloom,
     material,
+    material_library,
     metaso_minimax,
     muapi,
     ofox,
+    shot_alignment,
     sonilo,
+    storyboard as storyboard_service,
     subtitle,
     task_artifacts,
     twelvelabs,
@@ -758,6 +761,94 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return final_subtitle_path
 
 
+def _library_candidates(
+    media_paths: list[str], clip_duration: float
+) -> list[shot_alignment.MaterialCandidate]:
+    """把预处理后的素材路径还原成带库内标签的候选，供分镜规划打分。"""
+
+    index = material_library.get_index()
+    candidates: list[shot_alignment.MaterialCandidate] = []
+    for media_path in media_paths:
+        name = shot_alignment.source_name_of(media_path)
+        entry = index.get(name) or {}
+        kind = "image" if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) else "video"
+        duration = 0.0
+        try:
+            duration = float(entry.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration <= 0:
+            # 图片素材已经被渲染成固定时长的 zoom 片段；视频素材回落到库内
+            # 索引缺失时的默认片段长度，宁可保守也不要计划出超长的空片段。
+            duration = float(clip_duration or 5)
+        candidates.append(
+            shot_alignment.MaterialCandidate(
+                path=media_path,
+                name=name,
+                kind=kind,
+                duration=duration,
+                tags=tuple(entry.get("tags") or ()),
+                tags_en=tuple(entry.get("tags_en") or ()),
+            )
+        )
+    return candidates
+
+
+def build_shot_plan_inputs(
+    task_id,
+    params,
+    video_script: str,
+    subtitle_path: str,
+    audio_duration: float,
+    media_paths: list[str],
+) -> dict | None:
+    """为本地素材源准备分镜对齐输入。
+
+    素材库模式下上游 `generate_terms` 是被跳过的（本地素材不需要搜索词），
+    画面与文案是否对得上完全取决于这一步：LLM 分镜 → 字幕时间轴 → 逐镜头
+    选素材。任一环节不可用都退回旧的固定步长拼接，绝不因为规划失败而中断任务。
+    """
+
+    if not (params.match_materials_to_script and media_paths and video_script):
+        return None
+
+    try:
+        shots = storyboard_service.split_script(
+            params.video_subject, video_script, max_shots=storyboard_service.DEFAULT_MAX_SHOTS
+        )
+    except storyboard_service.StoryboardError as exc:
+        logger.warning(f"shot alignment disabled for task {task_id}: {exc}")
+        return None
+
+    candidates = _library_candidates(media_paths, params.video_clip_duration)
+    if not candidates:
+        return None
+
+    required = float(audio_duration or 0.0) + video._VIDEO_DURATION_SAFETY_MARGIN
+    return shot_alignment.build_plan_inputs(
+        shots=shots,
+        candidates=candidates,
+        audio_duration=audio_duration,
+        required_duration=required,
+        max_clip_duration=params.video_clip_duration,
+        clip_speed=params.video_clip_speed,
+        subtitle_path=subtitle_path,
+    )
+
+
+def _register_shot_gaps(task_id: str, plan) -> None:
+    """把没有对应画面的镜头登记为拍摄需求（任务卡片上给出补拍简报）。"""
+
+    if not plan.unmatched_shots:
+        return
+    try:
+        from app.services import shoot_needs as shoot_needs_service
+
+        shoot_needs_service.add_for_task(task_id, plan.unmatched_shots)
+    except Exception as exc:  # noqa: BLE001 - 需求登记失败不影响成片
+        logger.warning(f"cannot register shoot needs for {task_id}: {exc}")
+
+
 def get_video_materials(
     task_id,
     params,
@@ -1013,11 +1104,18 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    shot_plan_inputs: dict | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
     warnings = []
+    shot_plan_records: list[dict] = []
     allocate_batch_materials = params.video_count > 1 and params.video_source in {
         "pexels", "pixabay", "coverr", "local"
     }
@@ -1062,9 +1160,37 @@ def generate_final_videos(
         # 每条视频占 50% 进度中的一份，合成与最终编码各占一半。片段处理是
         # 合成里最耗时的部分，逐段推进这一半的进度。
         combine_share = 50 / params.video_count / 2
+        # 分镜对齐：第 2 条及以后换一套候选优先级，避免多条视频画面完全一致。
+        clip_plan = None
+        if shot_plan_inputs:
+            clip_plan = shot_alignment.build_clip_plan(
+                shots=shot_plan_inputs["shots"],
+                candidates=shot_plan_inputs["candidates"],
+                audio_duration=shot_plan_inputs["audio_duration"],
+                required_duration=shot_plan_inputs["required_duration"],
+                max_clip_duration=shot_plan_inputs["max_clip_duration"],
+                clip_speed=shot_plan_inputs["clip_speed"],
+                cues=shot_plan_inputs["cues"],
+                variant=index,
+            )
+            if index == 1:
+                _register_shot_gaps(task_id, clip_plan)
+            if clip_plan.shortfall > shot_alignment._DURATION_TOLERANCE_SECONDS:
+                warnings.append(
+                    {
+                        "code": "shot_plan_short",
+                        "video_index": index,
+                        "shortfall_seconds": round(clip_plan.shortfall, 1),
+                    }
+                )
+            clip_plan_dicts = clip_plan.as_dicts()
+            ordered_paths = clip_plan.material_paths or list(downloaded_videos)
+        else:
+            clip_plan_dicts = None
+            ordered_paths = downloaded_videos
         video.combine_videos(
             combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
+            video_paths=ordered_paths,
             audio_file=audio_file,
             video_aspect=params.video_aspect,
             video_fit_mode=params.video_fit_mode,
@@ -1076,8 +1202,33 @@ def generate_final_videos(
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
+            clip_plan=clip_plan_dicts,
             **batch_options,
         )
+        if clip_plan:
+            # 计划落盘：事后能逐镜头核对"这段旁白配了哪条素材"，也是排查
+            # 画面不贴题时唯一的事实来源。
+            shot_plan_records.append(
+                {
+                    "video_index": index,
+                    "clips": len(clip_plan.clips),
+                    "distinct_materials": len(clip_plan.material_paths),
+                    "gaps": [gap.get("term") or "" for gap in clip_plan.unmatched_shots],
+                    "shortfall_seconds": round(clip_plan.shortfall, 1),
+                    "items": [
+                        {
+                            "term": clip.term,
+                            "shot_index": clip.shot_index,
+                            "duration": round(clip.target_duration, 2),
+                            "source": path.basename(clip.file_path),
+                            "off_term": clip.off_term,
+                            "recycled": clip.recycled,
+                        }
+                        for clip in clip_plan.clips
+                    ],
+                }
+            )
+            task_artifacts.patch_script_data(task_id, shot_plan=shot_plan_records)
         if allocate_batch_materials:
             selected_sources = list(dict.fromkeys(used_video_paths))
             reused_sources = [file for file in selected_sources if source_usage.get(file, 0)]
@@ -1836,6 +1987,19 @@ def _run_pipeline(
     if type(params.video_concat_mode) is str:
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
+    # 本地素材源的分镜对齐：LLM 分镜 → 字幕时间轴 → 逐镜头选画面。
+    # 规划失败只记日志，仍按旧的固定步长拼接出片。
+    shot_plan_inputs = None
+    if stop_at == "video" and params.video_source == "local":
+        shot_plan_inputs = build_shot_plan_inputs(
+            task_id,
+            params,
+            video_script,
+            subtitle_path,
+            audio_duration,
+            downloaded_videos,
+        )
+
     # 6. Generate final videos
     final_video_paths, combined_video_paths, generation_warnings = (
         generate_final_videos(
@@ -1845,6 +2009,10 @@ def _run_pipeline(
             audio_file,
             subtitle_path,
             audio_duration,
+            # 只有真的规划出画面计划时才传新参数：既有调用方（含测试替身）
+            # 用位置参数/固定签名包装 generate_final_videos，多传一个 kwarg 会
+            # 打破它们。
+            **({"shot_plan_inputs": shot_plan_inputs} if shot_plan_inputs else {}),
         )
     )
 
