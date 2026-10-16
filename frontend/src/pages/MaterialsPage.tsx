@@ -41,6 +41,7 @@ const STATUS_LABEL: Record<string, { label: string; tone: 'neutral' | 'warn' | '
   low_quality: { label: '低质', tone: 'warn' },
   duplicate: { label: '与库内重复', tone: 'danger' },
   irrelevant: { label: '疑似无关', tone: 'danger' },
+  unusable: { label: '不能当空镜', tone: 'danger' },
   reject: { label: '不通过', tone: 'danger' },
 }
 

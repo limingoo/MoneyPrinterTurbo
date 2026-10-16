@@ -40,6 +40,7 @@ from app.config.config import (
     update_config_nonblocking,
 )
 from app.models.const import FILE_TYPE_IMAGES, FILE_TYPE_VIDEOS
+from app.services import shot_alignment
 from app.utils import file_security, utils
 
 _INDEX_KEY = "material_index"
@@ -58,7 +59,18 @@ _MOTION_FROZEN = 0.35
 _SHARP_LOW = 12.0
 
 _DUP_HASH_DISTANCE = 6
+# 256 位均值哈希的近重阈值（约 7.8%）。96x96 dHash 对"同一主体、不同构图"的
+# 照片不敏感（实测同款美甲特写相距 70~110 位），补一层 ahash 提高查重召回。
+_DUP_AHASH_DISTANCE = 20
 _VISION_TIMEOUT = 60
+# 入库归一化的画质上限：按**短边**封顶，而不是长边。
+# 旧逻辑 cap 长边 1080，把 1080x1920 的竖屏素材降成 607x1080，成片再放大回
+# 1080x1920，等于先缩小再放大，画面必糊。
+_DEFAULT_MAX_SHORT_SIDE = 1080
+_DEFAULT_INGEST_CRF = 21
+_DEFAULT_INGEST_PRESET = "fast"
+# 图片素材渲染出的派生片段（`<原名>.zoom-<hash>.mp4`），不属于用户素材。
+_ZOOM_ARTIFACT_PATTERN = re.compile(r"\.zoom-[0-9a-f]{4,}\.mp4$", re.IGNORECASE)
 
 
 # ===========================================================================
@@ -137,6 +149,10 @@ def list_library() -> dict:
             continue
         ext = entry.suffix.lower().lstrip(".")
         if ext not in FILE_TYPE_VIDEOS and ext not in FILE_TYPE_IMAGES:
+            continue
+        # `<原名>.zoom-<hash>.mp4` 是图片素材渲染出的派生产物，不是用户素材；
+        # 混进素材池会让同一张图既以 jpg 又以 mp4 出现两次。
+        if _ZOOM_ARTIFACT_PATTERN.search(entry.name):
             continue
         index_entry = tags_map.get(entry.name) or {}
         files.append(
@@ -377,9 +393,32 @@ def _merge_boundaries(times: list[float], duration: float) -> list[tuple[float, 
     return [(s, e) for s, e in segments if _SEGMENT_MIN_SECONDS * 0.6 <= e - s]
 
 
+def _ingest_settings() -> tuple[int, str, str]:
+    """入库转码参数：短边上限 / CRF / preset，均可在 config.toml 覆盖。"""
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(app_config.app.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        preset = str(app_config.app.get("ingest_preset") or _DEFAULT_INGEST_PRESET)
+    except Exception:  # noqa: BLE001 - 配置异常不得中断入库
+        preset = _DEFAULT_INGEST_PRESET
+    return (
+        max(240, _int("ingest_max_short_side", _DEFAULT_MAX_SHORT_SIDE)),
+        max(0, min(51, _int("ingest_crf", _DEFAULT_INGEST_CRF))),
+        preset or _DEFAULT_INGEST_PRESET,
+    )
+
+
 def _normalize_box(width: int, height: int) -> tuple[int, int]:
-    cap = 1080
-    scale = min(1.0, cap / max(width, height)) if max(width, height) > cap else 1.0
+    """按短边封顶，保证竖屏 1080x1920 / 横屏 1920x1080 都原样保留。"""
+
+    short_side = max(1, min(width, height))
+    cap = _ingest_settings()[0]
+    scale = min(1.0, cap / short_side)
     out_w = max(2, int(width * scale) // 2 * 2)
     out_h = max(2, int(height * scale) // 2 * 2)
     return out_w, out_h
@@ -437,6 +476,26 @@ def _dhash(frame: bytes) -> str:
     return "".join(str(b) for b in bits)
 
 
+def _ahash(frame: bytes) -> str:
+    """96x96 灰度帧降到 16x16 均值哈希：256 位，对重采样/轻微构图变化更稳。"""
+
+    small = []
+    for row in range(16):
+        cells = []
+        for col in range(16):
+            total = 0
+            for dy in range(6):
+                base = (row * 6 + dy) * 96
+                for dx in range(6):
+                    total += frame[base + col * 6 + dx]
+            cells.append(total // 36)
+        small.append(cells)
+    average = sum(sum(row) for row in small) / 256
+    return "".join(
+        "1" if cell > average else "0" for row in small for cell in row
+    )
+
+
 def _hamming(a: str, b: str) -> int:
     return sum(1 for x, y in zip(a, b) if x != y)
 
@@ -474,6 +533,39 @@ def _tech_verdict(metrics: dict, is_image: bool = False) -> tuple[str, str]:
     if 0 <= metrics["sharpness"] < _SHARP_LOW:
         return "low_quality", "画面偏糊"
     return "ok", ""
+
+
+def _duplicates_any(hashes: list, ahashes: list, existing: dict) -> bool:
+    """与库内任一素材的感知哈希足够接近即判重（dHash 64 位 + aHash 256 位）。"""
+
+    for existing_hash in existing.get("hashes") or []:
+        for my_hash in hashes:
+            if my_hash and existing_hash and _hamming(my_hash, existing_hash) <= _DUP_HASH_DISTANCE:
+                return True
+    for existing_hash in existing.get("ahashes") or []:
+        for my_hash in ahashes:
+            if my_hash and existing_hash and _hamming(my_hash, existing_hash) <= _DUP_AHASH_DISTANCE:
+                return True
+    return False
+
+
+# VLM 判定"与美业无关"时命中任一即认为无关。这些词在美业素材里不该出现，
+# 出现基本就是误判（实测一段带烧录字幕的亲子家庭日常被打上了"美睫体验"，
+# 却因为 beauty_related=true 混进了美甲店的素材库）。
+_OFF_DOMAIN_HINTS = (
+    "亲子", "儿童", "婴儿", "宝宝", "家庭日常", "生活记录", "游戏",
+    "代码", "办公", "文档", "屏幕翻拍", "风景", "宠物", "直播",
+)
+
+
+def _looks_beauty_related(tags: list) -> bool:
+    """标签启发式：明显跑题的素材判为无关。
+
+    只在 VLM 没给出 `beauty_related` 时使用；有明确结论时一律采信模型。
+    """
+
+    normalized = shot_alignment.normalize_text(" ".join(tags))
+    return not any(hint in normalized for hint in _OFF_DOMAIN_HINTS)
 
 
 # ===========================================================================
@@ -530,9 +622,15 @@ def _vlm_analyze(frames: list[bytes]) -> dict:
                 "这些画面来自同一段视频素材。请只输出一个 JSON，不要任何其他文字，格式："
                 '{"tags": ["中文内容标签，3~5个"], "tags_en": ["对应的英文标签"], '
                 '"beauty_related": true或false, "desc": "一句话内容描述", '
+                '"broll_usable": true或false, "broll_reason": "", '
                 '"reject": false, "reject_reason": ""}'
-                '。如果画面明显与美业无关（屏幕翻拍、办公文档、代码、游戏、宠物、风景等），'
-                '将 reject 设为 true 并在 reject_reason 说明。'
+                "。如果画面明显与美业无关（屏幕翻拍、办公文档、代码、游戏、宠物、风景等），"
+                "将 reject 设为 true 并在 reject_reason 说明。\n"
+                "broll_usable 判的是这段画面能不能当**空镜/素材**用（成片会重新配旁白和字幕）："
+                "画面里已烧录字幕/水印/弹幕、屏幕翻拍、对镜头讲话的聊天画面、办公文档与界面、"
+                "游戏录屏、二次剪辑过的片段，都设为 false 并在 broll_reason 说明；"
+                "单纯的人手操作、产品特写、场景空镜、带正常人物动作的镜头都可以是 true。"
+                "画面里的文字内容本身不影响判定（美甲店的海报也算可用）。"
             ),
         }
     ]
@@ -648,7 +746,7 @@ def _ingest_worker(job_id: str, filename: str) -> None:
     events: list[dict] = []
     counts = {
         "accepted": 0, "skipped": 0, "low_quality": 0,
-        "rejected_irrelevant": 0, "error": 0,
+        "rejected_irrelevant": 0, "unusable_as_broll": 0, "error": 0,
     }
     original = None
     try:
@@ -710,6 +808,7 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                         f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
                         f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2"
                     )
+                    _, ingest_crf, ingest_preset = _ingest_settings()
                     result = _run(
                         [
                             "-ss", f"{start_s:.2f}",
@@ -718,8 +817,8 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                             "-vf", normalized,
                             "-r", "25",
                             "-c:v", "libx264",
-                            "-preset", "veryfast",
-                            "-crf", "23",
+                            "-preset", ingest_preset,
+                            "-crf", str(ingest_crf),
                             "-pix_fmt", "yuv420p",
                             "-an",
                             str(tmp_seg),
@@ -739,25 +838,20 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                 _sample_gray_frames(tmp_seg, frames, is_image)
                 metrics = _tech_metrics(frames)
                 tech_status, tech_reason = _tech_verdict(metrics, is_image)
-                hashes = [_dhash(f) for f in frames[:: max(1, len(frames) // 3)][:3]]
+                sample_frames = frames[:: max(1, len(frames) // 3)][:3]
+                hashes = [_dhash(f) for f in sample_frames]
+                ahashes = [_ahash(f) for f in sample_frames]
 
                 # --- 查重 ---
                 duplicate_of: str | None = None
                 if tech_status != "reject":
-                    filename_padded = seg_name
                     for existing_name, existing in get_index().items():
-                        if existing_name == filename_padded:
+                        if existing_name == seg_name:
                             continue
                         if existing.get("status") not in ("ok", "low_quality"):
                             continue
-                        for existing_hash in existing.get("hashes") or []:
-                            for my_hash in hashes:
-                                if my_hash and existing_hash and _hamming(my_hash, existing_hash) <= _DUP_HASH_DISTANCE:
-                                    duplicate_of = existing_name
-                                    break
-                            if duplicate_of:
-                                break
-                        if duplicate_of:
+                        if _duplicates_any(hashes, ahashes, existing):
+                            duplicate_of = existing_name
                             break
 
                 # --- AI 打标 ---
@@ -765,8 +859,18 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                 vision = _vlm_analyze(jpegs)
                 tags = [t.strip() for t in (vision.get("tags") or []) if t.strip()]
                 tags_en = [t.strip() for t in (vision.get("tags_en") or []) if t.strip()]
-                relevant = bool(vision.get("beauty_related", True))
+                # 显式判据优先：模型给了 false 就采信；没给（字段缺失/解析失败）
+                # 才回落到标签启发式，避免因为模型偷懒而误杀整段素材。
+                relevant = vision.get("beauty_related")
+                if relevant is None:
+                    relevant = _looks_beauty_related(tags)
+                relevant = bool(relevant)
                 reject_reason = str(vision.get("reject_reason") or "").strip()
+                # 空镜可用性：画面里有烧录字幕/对镜头聊天/屏幕翻拍时，成片重新
+                # 配音加字幕会与画面里的话打架（实测"讲睫毛"的原声字幕压在美甲
+                # 旁白上）。VLM 没给出结论时默认放行，避免误杀。
+                broll_usable = bool(vision.get("broll_usable", True))
+                broll_reason = str(vision.get("broll_reason") or "").strip()
 
                 # --- 分诊 ---
                 if tech_status == "reject":
@@ -778,6 +882,7 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                         "tags": ["\u672a\u6253\u6807"],
                         "kind": kind,
                         "hashes": hashes,
+                        "ahashes": ahashes,
                     })
                     _add_event(job_id, {
                         "file": seg_name, "status": "rejected",
@@ -795,6 +900,7 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                         "tags": ["\u672a\u6253\u6807"],
                         "kind": kind,
                         "hashes": hashes,
+                        "ahashes": ahashes,
                     })
                     _add_event(job_id, {
                         "file": seg_name, "status": "duplicate",
@@ -813,10 +919,30 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                         "tags_en": tags_en[:6],
                         "kind": kind,
                         "hashes": hashes,
+                        "ahashes": ahashes,
                     })
                     _add_event(job_id, {
                         "file": seg_name, "status": "irrelevant",
                         "reason": f"疑似与美业无关：{reject_reason}",
+                        "restorable": True,
+                    })
+                    continue
+
+                if not broll_usable and broll_reason:
+                    shutil.move(str(tmp_seg), str(Path(_trash_dir()) / seg_name))
+                    counts["unusable_as_broll"] += 1
+                    _upsert(seg_name, {
+                        "status": "unusable",
+                        "status_reason": f"不适合当空镜：{broll_reason}",
+                        "tags": tags or ["\u672a\u6253\u6807"],
+                        "tags_en": tags_en[:6],
+                        "kind": kind,
+                        "hashes": hashes,
+                        "ahashes": ahashes,
+                    })
+                    _add_event(job_id, {
+                        "file": seg_name, "status": "unusable",
+                        "reason": f"不适合当空镜：{broll_reason}",
                         "restorable": True,
                     })
                     continue
@@ -839,10 +965,12 @@ def _ingest_worker(job_id: str, filename: str) -> None:
                     "tags": sorted(set(tags))[:6],
                     "tags_en": tags_en[:6],
                     "hashes": hashes,
+                    "ahashes": ahashes,
                     "kind": kind if is_image else "video",
                     "duration": round(_probe_media(final_path)[0], 1) if kind == "video" else None,
                     "metrics": metrics,
                     "beauty_related": relevant,
+                    "broll_usable": broll_usable,
                     "from": filename,
                 })
                 logger.info(f"ingested: {seg_name} ({status}) tags={tags[:3]}")
@@ -885,26 +1013,65 @@ def _entry_tags(entry: dict, filename: str) -> str:
     return " ".join(texts).lower()
 
 
+def _term_match_score(term: str, entry: dict, filename: str) -> float:
+    """关键词与库内条目的匹配分；0 表示不相关。
+
+    旧实现是纯子串命中且按索引顺序取前 6 个，"美甲"会把所有带美甲标签的
+    素材都算命中，排在前面的还是索引插入顺序，与"哪个更贴题"无关。
+    """
+
+    needle = shot_alignment.normalize_text(term)
+    if not needle:
+        return 0.0
+    score = 0.0
+    for tag in entry.get("tags") or []:
+        normalized = shot_alignment.normalize_text(str(tag))
+        if not normalized:
+            continue
+        if normalized == needle:
+            score = max(score, 3.0)
+        elif (
+            len(normalized) >= shot_alignment._MIN_TAG_MATCH_LENGTH
+            and len(needle) >= shot_alignment._MIN_TAG_MATCH_LENGTH
+            and (needle in normalized or normalized in needle)
+        ):
+            score = max(score, 2.0)
+    for tag in entry.get("tags_en") or []:
+        normalized = shot_alignment.normalize_text(str(tag)).replace(" ", "")
+        if not normalized:
+            continue
+        if normalized == needle.replace(" ", ""):
+            score = max(score, 2.5)
+        elif needle.replace(" ", "") in normalized:
+            score = max(score, 1.5)
+    if len(needle) >= shot_alignment._MIN_TAG_MATCH_LENGTH and needle in shot_alignment.normalize_text(filename):
+        score = max(score, 1.0)
+    return score
+
+
 def match_terms(video_terms: list[str]) -> dict:
+    """关键词预检：每个词命中哪些库内素材（按匹配分排序）。"""
+
+    index = get_index()
     covered: list[str] = []
     missing: list[str] = []
     matched: dict[str, list[str]] = {}
     for term in video_terms:
-        if not term.strip():
+        if not str(term).strip():
             continue
-        low = term.lower()
-        hits: list[str] = []
-        for filename, entry in get_index().items():
+        scored: list[tuple[float, str]] = []
+        for filename, entry in index.items():
             if entry.get("status") not in ("ok", "low_quality"):
                 continue
-            haystack = _entry_tags(entry, filename)
-            if low in haystack or any(low in t.lower() or t.lower() in low for t in (entry.get("tags") or [])):
-                hits.append(filename)
-        if hits:
-            covered.append(term)
-            matched[term] = hits[:6]
-        else:
+            score = _term_match_score(term, entry, filename)
+            if score > 0:
+                scored.append((score, filename))
+        if not scored:
             missing.append(term)
+            continue
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        covered.append(term)
+        matched[term] = [filename for _, filename in scored[:6]]
     return {"covered": covered, "missing": missing, "matched": matched}
 
 
