@@ -8,7 +8,7 @@ services:
       dockerfile: Dockerfile
     container_name: "moneyprinterturbo-webui"
     ports:
-      - "127.0.0.1:8501:8501"
+      - "0.0.0.0:8501:8501"
     command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
     volumes: *common-volumes
     restart: always
@@ -21,4 +21,14 @@ services:
       - "127.0.0.1:8080:8080"
     command: [ "python3", "main.py" ]
     volumes: *common-volumes
+    restart: always
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: "moneyprinterturbo-frontend"
+    ports:
+      - "0.0.0.0:8502:80"
+    depends_on:
+      - api
     restart: always
