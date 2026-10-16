@@ -40,21 +40,24 @@ import {
   checkMaterials,
   remixMaterials,
   getMaterialLibrary,
-  makeStoryboard,
-  addShootNeeds,
   addPendingCreation,
+  getConfig,
   type ClonedVoiceEntry,
   type MaterialCheckResult,
   type StoryboardShot,
+  type AIVideoProviderView,
+  type MaterialsConfigView,
 } from '../api/endpoints'
 import type { AudioOnlyRequest, FileInfo } from '../api/types'
 import {
   loadForm,
-  saveForm,
+  clearSavedForm,
   toParams,
   FONT_OPTIONS,
   TRANSITION_OPTIONS,
-  VIDEO_SOURCE_OPTIONS,
+  STOCK_VIDEO_SOURCES,
+  AI_VIDEO_SOURCE_LABELS,
+  hasSavedForm,
   type CreateForm,
 } from '../store/form'
 
@@ -85,6 +88,12 @@ type ConfigTab = 'visual' | 'voice' | 'subtitle' | 'music' | 'advanced'
 export function CreatePage({ onCreated }: { onCreated: () => void }) {
   const toast = useToast()
   const [form, setForm] = useState<CreateForm>(() => loadForm())
+  // 是否为「继续生成」快照：是则保留快照中的素材源，否则采用配置默认源
+  const [hadSnapshot] = useState(() => hasSavedForm())
+  // 后端 AI 视频配置（用于来源分组与模型只读说明）
+  const [aiVideoConfig, setAiVideoConfig] = useState<Record<string, AIVideoProviderView>>({})
+  // 后端图库源配置（用于判断图库源是否已配置密钥）
+  const [materialsConfig, setMaterialsConfig] = useState<MaterialsConfigView | null>(null)
   const [submitting, setSubmitting] = useState(false)
   // 提交细分阶段（用于按钮下面的进度提示）：storyboard=LLM 拆分镜（慢） match=库内匹配
   const [submitPhase, setSubmitPhase] = useState<'storyboard' | 'match' | null>(null)
@@ -145,7 +154,10 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
 
   const patch = (p: Partial<CreateForm>) => setForm((f) => ({ ...f, ...p }))
 
-  useEffect(() => saveForm(form), [form])
+  useEffect(() => {
+    // 表单不再持久化：刷新即空白。一次性快照读取后立即清除。
+    clearSavedForm()
+  }, [])
 
   useEffect(() => {
     // 兼容旧存档：Azure V2 音色自动切回免费 Edge 音色
@@ -157,6 +169,16 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     getBgmList()
       .then((r) => setBgmFiles(r.files))
       .catch(() => {})
+    // 读取已配置的 AI 视频源；无存档时采用配置的默认素材源
+    getConfig()
+      .then((c) => {
+        setAiVideoConfig(c.ai_video)
+        setMaterialsConfig(c.materials)
+        if (!hadSnapshot) {
+          patch({ video_source: c.materials.video_source || 'pexels' })
+        }
+      })
+      .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -167,6 +189,81 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form.video_terms, form.video_source])
+
+  /** AI 视频源选项：始终列出全部，未配置密钥的置灰不可选 */
+  const aiSourceOptions = useMemo(
+    () =>
+      Object.entries(AI_VIDEO_SOURCE_LABELS).map(([value, fallbackLabel]) => {
+        const p = aiVideoConfig[value]
+        const label = p?.label ?? fallbackLabel
+        const enabled = p?.enabled ?? false
+        return {
+          value,
+          label: enabled ? label : `${label}（未配置）`,
+          disabled: !enabled,
+        }
+      }),
+    [aiVideoConfig],
+  )
+
+  /** 图库源选项：未配置密钥的置灰不可选 */
+  const stockSourceOptions = useMemo(
+    () =>
+      STOCK_VIDEO_SOURCES.map((s) => {
+        const key = `${s.value}_api_keys` as
+          | 'pexels_api_keys'
+          | 'pixabay_api_keys'
+          | 'coverr_api_keys'
+        const count = materialsConfig?.[key]?.count ?? 0
+        return {
+          value: s.value,
+          label: count > 0 ? s.label : `${s.label}（未配置）`,
+          disabled: count === 0,
+        }
+      }),
+    [materialsConfig],
+  )
+
+  /** 素材来源下拉：图库 / AI 生成视频 / 本地 分组展示 */
+  const sourceGroups = useMemo(() => {
+    const ai: { value: string; label: string; disabled?: boolean }[] = [...aiSourceOptions]
+    const isKnownSource = STOCK_VIDEO_SOURCES.some((s) => s.value === form.video_source)
+    // 兼容：当前源已不在已知列表时仍保留展示，避免下拉空白
+    if (
+      !isKnownSource &&
+      form.video_source !== 'local' &&
+      !ai.some((s) => s.value === form.video_source)
+    ) {
+      ai.unshift({
+        value: form.video_source,
+        label: AI_VIDEO_SOURCE_LABELS[form.video_source] ?? form.video_source,
+      })
+    }
+    return [
+      { label: '图库检索', options: stockSourceOptions },
+      { label: 'AI 生成视频', options: ai },
+      { label: '本地', options: [{ value: 'local', label: '我的素材库', disabled: false }] },
+    ]
+  }, [aiSourceOptions, stockSourceOptions, form.video_source])
+
+  /** 当前 AI 视频源的只读说明（模型/分辨率/时长均来自设置页配置） */
+  const selectedAiProvider = aiVideoConfig[form.video_source]
+  const aiSourceSummary = useMemo(() => {
+    if (!selectedAiProvider) return null
+    if (!selectedAiProvider.enabled) return [`${selectedAiProvider.label} 未配置密钥`]
+    const val = (name: string) => {
+      const f = selectedAiProvider.fields[name]
+      return f ? String(f.value ?? f.default ?? '').trim() : ''
+    }
+    const min = val('min_duration')
+    const max = val('max_duration')
+    return [
+      selectedAiProvider.label,
+      val('model') || val('video_endpoint'),
+      val('resolution'),
+      min && max ? `${min}~${max}s` : '',
+    ].filter(Boolean)
+  }, [selectedAiProvider])
 
   /** 音色下拉：中文精简列表 */
   const voiceGroups = useMemo(() => {
@@ -309,7 +406,6 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     // ===== 素材准备（全部即时操作，毫秒级，不让人在创作页等 LLM）=====
     // 素材库源：全命中才出片；部分/零命中 → 挂起"等待素材"（续跑按钮）。
     let formToSubmit: CreateForm = form
-    let runBackgroundStoryboard = false
     const customAudioUsed = !!customAudio
 
     setSubmitting(true)
@@ -329,7 +425,9 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           }
           formToSubmit = {
             ...form,
-            local_materials: usable.slice(0, 12).map((file) => ({ name: file, file, size: 0 })),
+            // 逐镜头挑选由后端分镜规划完成，这里提交整池素材；
+            // 截断成 12 条会让后面的镜头无画面可用，只能重复前面的素材。
+            local_materials: usable.map((file) => ({ name: file, file, size: 0 })),
           }
         } else {
           // 有关键词：逐词命中；命中不全 → 挂起等待素材（用户规则：宁缺毋滥）
@@ -348,11 +446,11 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
           }
           const missing = result?.missing ?? terms
           if (missing.length === 0) {
-            // 全命中 → 立即出片（后台分镜分析仍会核对逐镜头缺口）
-            runBackgroundStoryboard = form.storyboard_align
+            // 全命中 → 立即出片（逐镜头的实际取用由后端分镜规划决定）
             formToSubmit = {
               ...form,
-              local_materials: files.slice(0, 12).map((file) => ({ name: file, file, size: 0 })),
+              // 命中文件全部下发：后端按分镜逐镜头挑，顺序由它决定。
+              local_materials: files.map((file) => ({ name: file, file, size: 0 })),
               video_concat_mode: form.storyboard_align ? 'sequential' : form.video_concat_mode,
             }
           } else {
@@ -388,14 +486,13 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
       }
     }
 
-    let taskId: string | undefined
     setSubmitPhase(null)
     setSubmitFailure(null)
     if (customAudio) {
-      taskId = (await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)).task_id
+      await createVideoWithCustomAudio(toParams(formToSubmit), customAudio)
       toast('success', '任务已提交（使用自定义配音），正在生成…')
     } else {
-      taskId = (await createVideo(toParams(formToSubmit))).task_id
+      await createVideo(toParams(formToSubmit))
       toast('success', '任务已提交，正在生成…')
     }
 
@@ -403,38 +500,8 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
     stopSubmit()
     onCreated()
 
-    // ===== 后台分镜分析（不阻塞提交，用户已可离开本页）=====
-    // 成功后逐镜头比对库内标签，把缺失镜头的拍摄简报登记到任务卡片上。
-    // 每天/每次点击都重算，结果通过任务页轮询展示。
-    if (runBackgroundStoryboard && taskId) {
-      void (async () => {
-        try {
-          const shots = (
-            await makeStoryboard({
-              video_subject: form.video_subject.trim(),
-              video_script: form.video_script.trim(),
-              video_language: form.video_language,
-            })
-          ).shots
-          const terms = [...new Set(shots.map((s) => s.term))]
-          const match = terms.length ? await checkMaterials(terms) : null
-          const pool: Record<string, string[]> = match?.matched ?? {}
-          const missing = shots.filter((s) => !(pool[s.term]?.length > 0))
-          if (missing.length > 0) {
-            await addShootNeeds(
-              taskId,
-              missing.map((s) => ({
-                term: s.term,
-                title: s.title || s.term,
-                brief: s.brief || '',
-              })),
-            )
-          }
-        } catch {
-          /* 后台分镜失败不影响已提交的任务；用户可再次生成时重试 */
-        }
-      })()
-    }
+    // 分镜对齐的画面规划与拍摄缺口登记都在后端完成：它拿到的是生成后的真实
+    // 文案（此时这里的 video_script 可能还是空的），所以不再在这里重复调用 LLM。
   }
 
   const CONFIG_TABS: { key: ConfigTab; label: string; icon: React.ReactElement }[] = [
@@ -581,11 +648,31 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
               {configTab === 'visual' && (
                 <>
                   <Row label="素材来源">
-                    <Segmented
+                    <Select
                       value={form.video_source}
-                      options={VIDEO_SOURCE_OPTIONS}
-                      onChange={(v) => patch({ video_source: v })}
-                    />
+                      onChange={(e) => patch({ video_source: e.target.value })}
+                    >
+                      {sourceGroups.map((g) => (
+                        <optgroup key={g.label} label={g.label}>
+                          {g.options.map((o) => (
+                            <option key={o.value} value={o.value} disabled={o.disabled}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </Select>
+                    {aiSourceSummary && (
+                      <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+                        AI 生成视频 · {aiSourceSummary.join(' · ')} ·{' '}
+                        <a
+                          href="#/settings/assets"
+                          className="text-brand underline decoration-dotted hover:opacity-80"
+                        >
+                          去设置
+                        </a>
+                      </p>
+                    )}
                     {form.video_source === 'local' && (
                       <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                         {checking ? (
@@ -644,7 +731,9 @@ export function CreatePage({ onCreated }: { onCreated: () => void }) {
                       />
                       <span className="text-[11px] leading-snug text-muted">
                         开启后按文案顺序逐句配画面
-                        {form.video_source === 'local' ? '（LLM 拆分镜 + 库内标签匹配）' : '（逐句匹配素材顺序）'}
+                        {form.video_source === 'local'
+                          ? '（后端按分镜逐镜头选素材并对齐时长）'
+                          : '（逐句匹配素材顺序）'}
                       </span>
                     </div>
                   </Row>

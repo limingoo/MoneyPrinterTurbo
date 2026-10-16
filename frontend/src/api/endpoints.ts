@@ -143,13 +143,39 @@ export interface LLMConfigView {
   }
 }
 
+export interface KeyListField {
+  count: number
+  masked: string
+}
+
 export interface MaterialsConfigView {
-  [key: string]: { count: number; masked: string }
+  pexels_api_keys: KeyListField
+  pixabay_api_keys: KeyListField
+  coverr_api_keys: KeyListField
+  /** 默认素材源（写入 config 的 video_source） */
+  video_source: string
+}
+
+/** AI 视频供应商字段：字符串型带 value/default，密钥型带 has_value/masked */
+export interface AIVideoField {
+  kind: 'secret' | 'secret_list' | 'int' | 'str'
+  value?: string | number
+  default?: string | number
+  has_value?: boolean
+  masked?: string
+  count?: number
+}
+
+export interface AIVideoProviderView {
+  label: string
+  enabled: boolean
+  fields: Record<string, AIVideoField>
 }
 
 export interface ConfigView {
   llm: LLMConfigView
   materials: MaterialsConfigView
+  ai_video: Record<string, AIVideoProviderView>
   tts: { siliconflow_api_key: SecretField }
   cloned_voices: ClonedVoiceEntry[]
 }
@@ -175,7 +201,19 @@ export interface MaterialsConfigUpdate {
   pexels_api_keys?: string
   pixabay_api_keys?: string
   coverr_api_keys?: string
-  wavespeed_api_keys?: string
+  video_source?: string
+}
+
+export interface AIVideoProviderUpdate {
+  api_key?: string
+  api_keys?: string
+  base_url?: string
+  model?: string
+  video_endpoint?: string
+  resolution?: string
+  min_duration?: number | null
+  max_duration?: number | null
+  provider?: string
 }
 
 export function getConfig(): Promise<ConfigView> {
@@ -185,6 +223,7 @@ export function getConfig(): Promise<ConfigView> {
 export function updateConfig(body: {
   llm?: LLMConfigUpdate
   materials?: MaterialsConfigUpdate
+  ai_video?: Record<string, AIVideoProviderUpdate>
 }): Promise<{ updated: string[] }> {
   return request('/api/v1/config', {
     method: 'PUT',

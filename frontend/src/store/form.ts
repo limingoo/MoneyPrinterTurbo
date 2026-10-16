@@ -84,11 +84,26 @@ export const TRANSITION_OPTIONS = [
   { value: 'ZoomOut', label: '缩小' },
 ]
 
-export const VIDEO_SOURCE_OPTIONS = [
+/** 图库检索来源（创作页分组展示） */
+export const STOCK_VIDEO_SOURCES = [
   { value: 'pexels', label: 'Pexels' },
   { value: 'pixabay', label: 'Pixabay' },
   { value: 'coverr', label: 'Coverr' },
-  { value: 'wavespeed', label: 'Wavespeed' },
+]
+
+/** AI 生成视频来源的展示名；实际可用项需在后端已配置密钥 */
+export const AI_VIDEO_SOURCE_LABELS: Record<string, string> = {
+  metaso_minimax: '秘塔 MiniMax',
+  ofox: 'OFox AI',
+  volcengine_seedance: '火山 Seedance',
+  wavespeed: 'WaveSpeed AI',
+  muapi: 'MuAPI',
+}
+
+/** 全部合法素材源（含未配置的 AI 源），用于旧存档校验 */
+export const VIDEO_SOURCE_OPTIONS = [
+  ...STOCK_VIDEO_SOURCES,
+  ...Object.entries(AI_VIDEO_SOURCE_LABELS).map(([value, label]) => ({ value, label })),
   { value: 'local', label: '我的素材库' },
 ]
 
@@ -149,9 +164,32 @@ export function loadForm(): CreateForm {
   }
 }
 
+/**
+ * 是否为「继续生成」的一次性快照（用于决定是否采用后端配置的默认素材源）。
+ *
+ * 表单本身不做持久化（刷新即空白）；该存储仅承载任务页「继续生成」的显式交接，
+ * 由创作页读取后立即清除。
+ */
+export function hasSavedForm(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEY) !== null
+  } catch {
+    return false
+  }
+}
+
 export function saveForm(form: CreateForm) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(form))
+  } catch {
+    /* 存储不可用时忽略 */
+  }
+}
+
+/** 消费一次性快照：读取后清除，避免其残留影响后续刷新 */
+export function clearSavedForm() {
+  try {
+    localStorage.removeItem(STORAGE_KEY)
   } catch {
     /* 存储不可用时忽略 */
   }

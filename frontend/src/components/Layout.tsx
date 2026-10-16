@@ -8,8 +8,10 @@ import {
   Moon,
   Circle,
   Folder,
+  ChevronRight,
 } from 'lucide-react'
 import { ping } from '../api/endpoints'
+import { SETTINGS_TABS, settingsTabFromHash, type SettingsTab } from './settingsTabs'
 
 export type Page = 'create' | 'tasks' | 'materials' | 'settings'
 
@@ -34,6 +36,23 @@ export function Layout({
     return saved ? saved === 'dark' : true
   })
   const [apiOnline, setApiOnline] = useState<boolean | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(true)
+  const [activeTab, setActiveTab] = useState<SettingsTab>(settingsTabFromHash)
+
+  useEffect(() => {
+    const onHash = () => setActiveTab(settingsTabFromHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
+  const handleSettingsNav = () => {
+    if (page === 'settings') {
+      setSettingsOpen((v) => !v)
+    } else {
+      setSettingsOpen(true)
+      onNavigate('settings')
+    }
+  }
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
@@ -71,20 +90,58 @@ export function Layout({
         </div>
 
         <nav className="mt-2 flex flex-col gap-1 px-3">
-          {NAV_ITEMS.map((item) => (
-            <button
-              key={item.key}
-              onClick={() => onNavigate(item.key)}
-              className={`flex items-center gap-3 rounded-xl px-4 py-2.5 text-sm font-medium transition-all ${
-                page === item.key
-                  ? 'bg-gradient-to-r from-brand/15 to-brand2/10 text-brand'
-                  : 'text-muted hover:bg-panel2 hover:text-ink'
-              }`}
-            >
-              {item.icon}
-              {item.label}
-            </button>
-          ))}
+          {NAV_ITEMS.map((item) => {
+            const isSettings = item.key === 'settings'
+            return (
+              <div key={item.key}>
+                <button
+                  onClick={() => (isSettings ? handleSettingsNav() : onNavigate(item.key))}
+                  className={`flex w-full items-center gap-3 rounded-xl px-4 py-2.5 text-sm font-medium transition-all ${
+                    page === item.key
+                      ? 'bg-gradient-to-r from-brand/15 to-brand2/10 text-brand'
+                      : 'text-muted hover:bg-panel2 hover:text-ink'
+                  }`}
+                >
+                  {item.icon}
+                  {item.label}
+                  {isSettings && (
+                    <ChevronRight
+                      size={15}
+                      className={`ml-auto transition-transform ${
+                        settingsOpen ? 'rotate-90' : ''
+                      }`}
+                    />
+                  )}
+                </button>
+                {isSettings && settingsOpen && (
+                  <div className="mt-1 flex flex-col gap-0.5 pl-4">
+                    {SETTINGS_TABS.map((t) => {
+                      const active = page === 'settings' && activeTab === t.key
+                      return (
+                        <a
+                          key={t.key}
+                          href={`#/settings/${t.key}`}
+                          onClick={() => setSettingsOpen(true)}
+                          className={`flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-[13px] transition-colors ${
+                            active
+                              ? 'bg-panel2 font-medium text-brand'
+                              : 'text-muted hover:bg-panel2/70 hover:text-ink'
+                          }`}
+                        >
+                          <span
+                            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                              active ? 'bg-brand' : 'bg-line'
+                            }`}
+                          />
+                          <span className="truncate">{t.label}</span>
+                        </a>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </nav>
 
         <div className="mt-auto space-y-3 px-5 pb-5">

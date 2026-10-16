@@ -8,6 +8,8 @@ import {
   BrainCircuit,
   Images,
   PlugZap,
+  Captions,
+  ChevronRight,
 } from 'lucide-react'
 import {
   Card,
@@ -30,21 +32,69 @@ import {
   saveSiliconFlowKey,
   type ConfigView,
   type LLMProviderMeta,
+  type AIVideoField,
+  type AIVideoProviderUpdate,
 } from '../api/endpoints'
 import { Upload, Mic } from 'lucide-react'
+import { SETTINGS_TABS, settingsTabFromHash, type SettingsTab } from '../components/settingsTabs'
 
 const MATERIAL_LABELS: Record<string, string> = {
   pexels_api_keys: 'Pexels API Keys',
   pixabay_api_keys: 'Pixabay API Keys',
   coverr_api_keys: 'Coverr API Keys',
-  wavespeed_api_keys: 'Wavespeed API Keys',
 }
 
 const MATERIAL_LINKS: Record<string, string> = {
   pexels_api_keys: 'https://www.pexels.com/api/',
   pixabay_api_keys: 'https://pixabay.com/api/docs/',
   coverr_api_keys: 'https://coverr.co/',
-  wavespeed_api_keys: 'https://wavespeed.ai/',
+}
+
+// 图库检索源：value 即写入 config 的 video_source 值
+const STOCK_SOURCES = [
+  { value: 'pexels', key: 'pexels_api_keys', label: 'Pexels' },
+  { value: 'pixabay', key: 'pixabay_api_keys', label: 'Pixabay' },
+  { value: 'coverr', key: 'coverr_api_keys', label: 'Coverr' },
+] as const
+
+// AI 视频供应商的展示顺序与字段标签。字段值来自后端 /config 的 ai_video。
+const AI_VIDEO_FIELD_ORDER: Record<string, string[]> = {
+  metaso_minimax: ['api_key', 'resolution', 'base_url'],
+  ofox: ['api_key', 'model', 'resolution', 'min_duration', 'max_duration', 'provider', 'base_url'],
+  volcengine_seedance: ['api_key', 'model', 'resolution', 'min_duration', 'max_duration', 'base_url'],
+  wavespeed: ['api_keys', 'model', 'min_duration', 'max_duration'],
+  muapi: ['api_key', 'video_endpoint', 'resolution', 'min_duration', 'max_duration', 'base_url'],
+}
+
+const AI_VIDEO_FIELD_LABELS: Record<string, string> = {
+  api_key: 'API Key',
+  api_keys: 'API Keys',
+  base_url: 'Base URL',
+  model: '模型',
+  video_endpoint: '模型端点',
+  resolution: '分辨率',
+  min_duration: '最短时长（秒）',
+  max_duration: '最长时长（秒）',
+  provider: '上游供应商',
+}
+
+// 高级字段默认折叠，避免主界面过长。
+const AI_VIDEO_ADVANCED_FIELDS = new Set(['base_url', 'provider'])
+
+// 需要下拉选择的字段（provider/field → 选项）。
+const AI_VIDEO_SELECT_OPTIONS: Record<string, string[]> = {
+  'metaso_minimax/resolution': ['768P', '2K'],
+  'volcengine_seedance/resolution': ['480p', '720p', '1080p'],
+  'ofox/resolution': ['480p', '720p'],
+  'ofox/provider': ['byteplus', 'volcengine'],
+}
+
+const AI_VIDEO_HELP: Record<string, string> = {
+  metaso_minimax: '秘塔代理的 MiniMax H3 文生视频，服务端仅支持 768P / 2K',
+  ofox: 'OFox 聚合的 Seedance / Wan 等文生视频模型，单一密钥',
+  volcengine_seedance: '火山引擎方舟 Seedance 异步视频生成，按提交片段计费',
+  wavespeed: 'WaveSpeed AI 文生视频，按请求计费',
+  muapi: 'MuAPI 文生视频端点，模型由「模型端点」字段决定，按请求计费',
 }
 
 export function SettingsPage({
@@ -79,11 +129,30 @@ export function SettingsPage({
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null)
   const [savingMaterials, setSavingMaterials] = useState(false)
+  // 默认素材源 + AI 视频供应商的可编辑字段
+  const [videoSource, setVideoSource] = useState('pexels')
+  const [aiVideoEdits, setAiVideoEdits] = useState<Record<string, Record<string, string>>>({})
+  const [expandedProvider, setExpandedProvider] = useState<string | null>(null)
+  const [savingProvider, setSavingProvider] = useState<string | null>(null)
+  const [tab, setTab] = useState<SettingsTab>(settingsTabFromHash)
+
+  const goTab = (key: SettingsTab) => {
+    location.hash = `#/settings/${key}`
+    setTab(key)
+  }
+
+  useEffect(() => {
+    const onHash = () => setTab(settingsTabFromHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
   const loadConfig = () => {
     getConfig()
       .then((c) => {
         setCfg(c)
+        setVideoSource(c.materials.video_source || 'pexels')
+        setAiVideoEdits({})
         setLlmProvider(c.llm.provider)
         setLlmBaseUrl(c.llm.values.base_url.value)
         setLlmModel(c.llm.values.model_name.value)
@@ -181,18 +250,165 @@ export function SettingsPage({
       for (const [key, value] of Object.entries(materialKeys)) {
         if (value.trim() !== '') payload[key] = value
       }
-      if (Object.keys(payload).length === 0) {
-        toast('error', '没有修改需要保存')
-        return
-      }
-      await updateConfig({ materials: payload })
-      toast('success', '素材源密钥已保存并即时生效')
+      await updateConfig({ materials: { ...payload, video_source: videoSource } })
+      toast('success', '图库配置已保存并即时生效')
       loadConfig()
     } catch (e) {
       toast('error', e instanceof Error ? e.message : '保存失败')
     } finally {
       setSavingMaterials(false)
     }
+  }
+
+  const handleSaveProvider = async (pid: string) => {
+    if (!cfg) return
+    const provider = cfg.ai_video[pid]
+    const edits = aiVideoEdits[pid] ?? {}
+    const payload: Record<string, string | number> = {}
+    for (const name of AI_VIDEO_FIELD_ORDER[pid] ?? []) {
+      if (!(name in edits)) continue
+      const field = provider.fields[name]
+      const raw = edits[name].trim()
+      if (field?.kind === 'int') {
+        if (raw === '') continue
+        payload[name] = Number(raw)
+      } else {
+        payload[name] = raw
+      }
+    }
+    if (Object.keys(payload).length === 0) {
+      toast('error', '没有修改需要保存')
+      return
+    }
+    setSavingProvider(pid)
+    try {
+      await updateConfig({ ai_video: { [pid]: payload as AIVideoProviderUpdate } })
+      toast('success', `${provider.label} 已保存并即时生效`)
+      loadConfig()
+    } catch (e) {
+      toast('error', e instanceof Error ? e.message : '保存失败')
+    } finally {
+      setSavingProvider(null)
+    }
+  }
+
+  /** AI 视频供应商单个字段的受控值：密钥类未编辑时留空，其余回退配置/默认值。 */
+  const aiFieldValue = (pid: string, name: string, field: AIVideoField) => {
+    const edited = aiVideoEdits[pid]?.[name]
+    if (edited !== undefined) return edited
+    if (field.kind === 'secret' || field.kind === 'secret_list') return ''
+    return String(field.value ?? field.default ?? '')
+  }
+
+  const aiFieldHint = (field: AIVideoField) => {
+    if (field.kind === 'secret_list') {
+      return field.count
+        ? `已配置 ${field.count} 个（${field.masked}），留空不修改`
+        : '未配置；多个 Key 用逗号分隔'
+    }
+    if (field.kind === 'secret') {
+      return field.has_value ? `已配置（${field.masked}），留空不修改` : '未配置'
+    }
+    return field.default !== undefined && String(field.default) !== ''
+      ? `默认：${field.default}`
+      : undefined
+  }
+
+  // 仅列出已配置密钥、可在创作页直接使用的 AI 视频源
+  const enabledAiSources = cfg
+    ? Object.entries(cfg.ai_video).filter(([, p]) => p.enabled)
+    : []
+
+  const renderAiProvider = (pid: string) => {
+    if (!cfg) return null
+    const provider = cfg.ai_video[pid]
+    if (!provider) return null
+    const open = expandedProvider === pid
+    const fields = AI_VIDEO_FIELD_ORDER[pid] ?? Object.keys(provider.fields)
+    const primary = fields.filter((n) => !AI_VIDEO_ADVANCED_FIELDS.has(n))
+    const advanced = fields.filter((n) => AI_VIDEO_ADVANCED_FIELDS.has(n))
+
+    const renderField = (name: string) => {
+      const field = provider.fields[name]
+      if (!field) return null
+      const label = AI_VIDEO_FIELD_LABELS[name] ?? name
+      const isSecret = field.kind === 'secret' || field.kind === 'secret_list'
+      const selectOptions = AI_VIDEO_SELECT_OPTIONS[`${pid}/${name}`]
+      const value = aiFieldValue(pid, name, field)
+      const onChange = (v: string) =>
+        setAiVideoEdits((prev) => ({ ...prev, [pid]: { ...(prev[pid] ?? {}), [name]: v } }))
+      return (
+        <Field key={name} label={label} hint={aiFieldHint(field)}>
+          {selectOptions ? (
+            <Select value={value} onChange={(e) => onChange(e.target.value)}>
+              {selectOptions.map((o) => (
+                <option key={o} value={o}>
+                  {o}
+                </option>
+              ))}
+            </Select>
+          ) : (
+            <Input
+              type={isSecret ? 'password' : field.kind === 'int' ? 'number' : 'text'}
+              placeholder={
+                isSecret
+                  ? field.has_value || field.count
+                    ? '已保存，留空不修改'
+                    : '粘贴密钥'
+                  : String(field.default ?? '')
+              }
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+            />
+          )}
+        </Field>
+      )
+    }
+
+    return (
+      <div key={pid} className="rounded-xl border border-line">
+        <button
+          type="button"
+          onClick={() => setExpandedProvider(open ? null : pid)}
+          className="flex w-full items-center gap-2.5 px-4 py-3 text-left transition-colors hover:bg-panel2/60"
+        >
+          <ChevronRight
+            size={15}
+            className={`shrink-0 text-muted transition-transform ${open ? 'rotate-90' : ''}`}
+          />
+          <span className="text-sm font-medium text-ink">{provider.label}</span>
+          <Badge tone={provider.enabled ? 'success' : 'neutral'}>
+            {provider.enabled ? '已配置' : '未配置'}
+          </Badge>
+          {AI_VIDEO_HELP[pid] && (
+            <span className="ml-auto hidden truncate pl-3 text-[11px] text-muted md:block">
+              {AI_VIDEO_HELP[pid]}
+            </span>
+          )}
+        </button>
+        {open && (
+          <div className="space-y-4 border-t border-line px-4 py-4">
+            <div className="grid gap-4 md:grid-cols-3">{primary.map(renderField)}</div>
+            {advanced.length > 0 && (
+              <details className="rounded-lg border border-line/70 px-3 py-2">
+                <summary className="cursor-pointer text-xs text-muted">高级</summary>
+                <div className="mt-3 grid gap-4 md:grid-cols-3">{advanced.map(renderField)}</div>
+              </details>
+            )}
+            <div className="flex items-center gap-3">
+              <Button
+                variant="primary"
+                loading={savingProvider === pid}
+                onClick={() => void handleSaveProvider(pid)}
+              >
+                保存
+              </Button>
+              <span className="text-xs text-muted">保存后对后续生成任务生效</span>
+            </div>
+          </div>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -202,9 +418,31 @@ export function SettingsPage({
         <h1 className="text-xl font-bold">设置</h1>
       </div>
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        {/* ===== LLM 配置 ===== */}
-        <Card title="AI 模型（LLM）" icon={<BrainCircuit size={16} />} className="lg:col-span-2">
+      {/* 移动端：全局侧边栏隐藏，这里用横向 tab 提供同样的分组切换 */}
+      <nav className="flex gap-1 overflow-x-auto pb-1 lg:hidden">
+        {SETTINGS_TABS.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => goTab(t.key)}
+            className={`flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2 text-sm font-medium transition-all ${
+              tab === t.key
+                ? 'bg-gradient-to-r from-brand/15 to-brand2/10 text-brand'
+                : 'text-muted hover:bg-panel2 hover:text-ink'
+            }`}
+          >
+            {t.icon}
+            <span className="whitespace-nowrap">{t.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      <div className="space-y-5">
+        {/* ===== 文案与脚本模型 ===== */}
+        <Card
+          title="AI 模型（LLM）"
+          icon={<BrainCircuit size={16} />}
+          className={tab === 'llm' ? '' : 'hidden'}
+        >
           {!cfg ? (
             <p className="text-sm text-muted">加载中…</p>
           ) : (
@@ -314,19 +552,46 @@ export function SettingsPage({
           )}
         </Card>
 
-        {/* ===== 素材源 ===== */}
-        <Card title="素材源 API Keys" icon={<Images size={16} />} className="lg:col-span-2">
+        {/* ===== 图库检索与默认素材源 ===== */}
+        <Card
+          title="图库检索与默认素材源"
+          icon={<Images size={16} />}
+          className={tab === 'assets' ? '' : 'hidden'}
+        >
           {!cfg ? (
             <p className="text-sm text-muted">加载中…</p>
           ) : (
             <div className="space-y-4">
+              <Field label="默认素材源" hint="创作页新建时默认选中；AI 源需先配置密钥">
+                <Select value={videoSource} onChange={(e) => setVideoSource(e.target.value)}>
+                  <optgroup label="图库检索">
+                    {STOCK_SOURCES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  {enabledAiSources.length > 0 && (
+                    <optgroup label="AI 生成视频">
+                      {enabledAiSources.map(([id, p]) => (
+                        <option key={id} value={id}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  <optgroup label="本地">
+                    <option value="local">我的素材库</option>
+                  </optgroup>
+                </Select>
+              </Field>
               <div className="grid gap-4 md:grid-cols-2">
-                {Object.keys(MATERIAL_LABELS).map((key) => {
-                  const state = cfg.materials[key]
+                {STOCK_SOURCES.map((s) => {
+                  const state = cfg.materials[s.key]
                   return (
                     <Field
-                      key={key}
-                      label={MATERIAL_LABELS[key]}
+                      key={s.key}
+                      label={MATERIAL_LABELS[s.key]}
                       hint={
                         state?.count
                           ? `已配置 ${state.count} 个（${state.masked}…），留空不修改`
@@ -336,35 +601,55 @@ export function SettingsPage({
                       <div className="flex gap-2">
                         <Input
                           placeholder="多个 Key 用逗号分隔"
-                          value={materialKeys[key] ?? ''}
+                          value={materialKeys[s.key] ?? ''}
                           onChange={(e) =>
-                            setMaterialKeys((m) => ({ ...m, [key]: e.target.value }))
+                            setMaterialKeys((m) => ({ ...m, [s.key]: e.target.value }))
                           }
                         />
-                        {MATERIAL_LINKS[key] && (
-                          <a
-                            href={MATERIAL_LINKS[key]}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex h-10 shrink-0 items-center text-xs text-muted underline decoration-dotted hover:text-brand"
-                          >
-                            申请
-                          </a>
-                        )}
+                        <a
+                          href={MATERIAL_LINKS[s.key]}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex h-10 shrink-0 items-center text-xs text-muted underline decoration-dotted hover:text-brand"
+                        >
+                          申请
+                        </a>
                       </div>
                     </Field>
                   )
                 })}
               </div>
               <Button variant="primary" loading={savingMaterials} onClick={handleSaveMaterials}>
-                保存素材源密钥
+                保存图库配置
               </Button>
             </div>
           )}
         </Card>
 
-        {/* ===== 声音克隆 ===== */}
-        <Card title="声音克隆" icon={<Mic size={16} />} className="lg:col-span-2">
+        {/* ===== AI 生成视频（文生视频） ===== */}
+        <Card
+          title="AI 生成视频（文生视频）"
+          icon={<PlugZap size={16} />}
+          className={tab === 'assets' ? '' : 'hidden'}
+        >
+          {!cfg ? (
+            <p className="text-sm text-muted">加载中…</p>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-muted">
+                配置密钥与生成模型；保存后创作页才会出现对应素材源，按提交片段计费。
+              </p>
+              {Object.keys(AI_VIDEO_FIELD_ORDER).map((pid) => renderAiProvider(pid))}
+            </div>
+          )}
+        </Card>
+
+        {/* ===== 配音 TTS：声音克隆 ===== */}
+        <Card
+          title="声音克隆（SiliconFlow）"
+          icon={<Mic size={16} />}
+          className={tab === 'tts' ? '' : 'hidden'}
+        >
           {!cfg ? (
             <p className="text-sm text-muted">加载中…</p>
           ) : (
@@ -528,8 +813,24 @@ export function SettingsPage({
           )}
         </Card>
 
-        {/* ===== 外观 ===== */}
-        <Card title="外观" icon={dark ? <Moon size={16} /> : <Sun size={16} />}>
+        {/* ===== 字幕（Whisper） ===== */}
+        <Card
+          title="字幕（Whisper）"
+          icon={<Captions size={16} />}
+          className={tab === 'subtitle' ? '' : 'hidden'}
+        >
+          <p className="text-sm text-muted">
+            字幕模型（Whisper 的 model_size、device、compute_type 等）目前仍需在
+            config.toml 的 [whisper] 段手动配置，后续版本会在此页面开放编辑。
+          </p>
+        </Card>
+
+        {/* ===== 通用与系统：外观 ===== */}
+        <Card
+          title="外观"
+          icon={dark ? <Moon size={16} /> : <Sun size={16} />}
+          className={tab === 'system' ? '' : 'hidden'}
+        >
           <button
             onClick={onToggleTheme}
             className="flex w-full items-center justify-between rounded-xl border border-line bg-panel2 px-4 py-3 text-sm transition-colors hover:border-brand/40"
@@ -549,8 +850,12 @@ export function SettingsPage({
           </button>
         </Card>
 
-        {/* ===== API 连接 ===== */}
-        <Card title="API 连接" icon={<Info size={16} />}>
+        {/* ===== 通用与系统：API 连接 ===== */}
+        <Card
+          title="API 连接"
+          icon={<Info size={16} />}
+          className={tab === 'system' ? '' : 'hidden'}
+        >
           <div className="space-y-3 text-sm">
             <div className="flex items-center justify-between">
               <span className="text-muted">连接状态</span>
@@ -568,8 +873,12 @@ export function SettingsPage({
           </div>
         </Card>
 
-        {/* ===== 浏览器本地 API Key ===== */}
-        <Card title="浏览器访问密钥" icon={<KeyRound size={16} />} className="lg:col-span-2">
+        {/* ===== 通用与系统：浏览器本地 API Key ===== */}
+        <Card
+          title="浏览器访问密钥"
+          icon={<KeyRound size={16} />}
+          className={tab === 'system' ? '' : 'hidden'}
+        >
           <Field label="访问密钥（可选）" hint="仅当 config.toml 配置了 app.api_key 时需要填写">
             <div className="flex gap-2">
               <Input

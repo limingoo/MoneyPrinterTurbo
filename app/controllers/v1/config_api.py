@@ -38,15 +38,124 @@ from app.utils import utils
 
 router = new_router(dependencies=[Depends(base.verify_token)])
 
-# 允许通过 HTTP 修改的素材源密钥（config.toml [app] 内的扁平键）。
-_MATERIALS_KEYS = (
+# 允许通过 HTTP 修改的图库检索密钥（config.toml [app] 内的扁平键）。
+_STOCK_MATERIAL_KEYS = (
     "pexels_api_keys",
     "pixabay_api_keys",
     "coverr_api_keys",
-    "wavespeed_api_keys",
 )
 
 _LLM_FIELD_SUFFIXES = ("api_key", "base_url", "model_name")
+
+# AI 视频（文生视频）供应商注册表。每个字段映射到 [app] 里的扁平键并声明类型，
+# GET 据此生成掩码视图，PUT 据此做类型转换。类型取值：
+#   secret      -> 单个密钥，掩码返回
+#   secret_list -> 逗号分隔的密钥列表，掩码返回
+#   int         -> 整数（时长等）
+#   str         -> 普通字符串
+# 供应商顺序即前端展示顺序，与 WebUI 的 VIDEO_SOURCE_GROUPS 业务顺序一致：
+# 秘塔 MiniMax → OFox → 火山 Seedance → WaveSpeed → MuAPI。
+_AI_VIDEO_PROVIDERS: dict[str, dict] = {
+    "metaso_minimax": {
+        "label": "秘塔 MiniMax",
+        "fields": [
+            ("api_key", "metaso_minimax_api_key", "secret"),
+            ("resolution", "metaso_minimax_resolution", "str"),
+            ("base_url", "metaso_minimax_base_url", "str"),
+        ],
+        "defaults": {
+            "base_url": "https://metaso.cn/api/minimax",
+            # 服务端仅接受 768P / 2K；此处展示默认值，实际以服务端校验为准。
+            "resolution": "2K",
+        },
+    },
+    "ofox": {
+        "label": "OFox AI",
+        "fields": [
+            ("api_key", "ofox_api_key", "secret"),
+            ("base_url", "ofox_base_url", "str"),
+            ("model", "ofox_text_to_video_model", "str"),
+            ("resolution", "ofox_resolution", "str"),
+            ("min_duration", "ofox_min_duration", "int"),
+            ("max_duration", "ofox_max_duration", "int"),
+            ("provider", "ofox_provider", "str"),
+        ],
+        "defaults": {
+            "base_url": "https://api.ofox.ai/v1",
+            "model": "bytedance/seedance-2.0-fast",
+            "resolution": "720p",
+            "min_duration": 4,
+            "max_duration": 15,
+            "provider": "byteplus",
+        },
+    },
+    "volcengine_seedance": {
+        "label": "火山引擎 Seedance",
+        "fields": [
+            ("api_key", "volcengine_seedance_api_key", "secret"),
+            ("base_url", "volcengine_seedance_base_url", "str"),
+            ("model", "volcengine_seedance_model", "str"),
+            ("resolution", "volcengine_seedance_resolution", "str"),
+            ("min_duration", "volcengine_seedance_min_duration", "int"),
+            ("max_duration", "volcengine_seedance_max_duration", "int"),
+        ],
+        "defaults": {
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "model": "doubao-seedance-1-0-pro-250528",
+            "resolution": "1080p",
+            "min_duration": 2,
+            "max_duration": 12,
+        },
+    },
+    "wavespeed": {
+        "label": "WaveSpeed AI",
+        "fields": [
+            ("api_keys", "wavespeed_api_keys", "secret_list"),
+            ("model", "wavespeed_text_to_video_model", "str"),
+            ("min_duration", "wavespeed_min_duration", "int"),
+            ("max_duration", "wavespeed_max_duration", "int"),
+        ],
+        "defaults": {
+            "model": "bytedance/seedance-2.0-fast/text-to-video",
+            "min_duration": 4,
+            "max_duration": 15,
+        },
+    },
+    "muapi": {
+        "label": "MuAPI",
+        "fields": [
+            ("api_key", "muapi_api_key", "secret"),
+            # video_endpoint 即 MuAPI 的模型端点（如 seedance-lite-t2v）。
+            ("video_endpoint", "muapi_video_endpoint", "str"),
+            ("resolution", "muapi_resolution", "str"),
+            ("min_duration", "muapi_min_duration", "int"),
+            ("max_duration", "muapi_max_duration", "int"),
+            ("base_url", "muapi_base_url", "str"),
+        ],
+        "defaults": {
+            "video_endpoint": "seedance-lite-t2v",
+            "resolution": "480p",
+            "min_duration": 3,
+            "max_duration": 12,
+            "base_url": "https://api.muapi.ai/api/v1",
+        },
+    },
+}
+
+# 可用于默认素材源（video_source）的全部取值，与 task.py 的受支持来源一致。
+_KNOWN_VIDEO_SOURCES = (
+    "pexels",
+    "pixabay",
+    "coverr",
+    "wavespeed",
+    "volcengine_seedance",
+    "ofox",
+    "metaso_minimax",
+    "muapi",
+    "loomloom",
+    "openai_image",
+    "local",
+)
 
 _MASK_VISIBLE_CHARS = 4
 
@@ -84,6 +193,41 @@ def _mask_secret(value) -> dict:
     if len(text) <= _MASK_VISIBLE_CHARS:
         return {"has_value": True, "masked": "••••"}
     return {"has_value": True, "masked": f"••••{text[-_MASK_VISIBLE_CHARS:]}"}
+
+
+def _ai_video_view(app_section) -> dict:
+    """生成 AI 视频供应商的掩码视图，并标注每个供应商是否已配置可用。
+
+    `enabled` 只看密钥是否已配置（含列表型），足以驱动前端"只列已配置来源"。
+    """
+
+    view: dict[str, dict] = {}
+    for provider_id, spec in _AI_VIDEO_PROVIDERS.items():
+        fields: dict[str, dict] = {}
+        enabled = False
+        for name, config_key, kind in spec["fields"]:
+            raw = app_section.get(config_key)
+            default = spec["defaults"].get(name, "")
+            if kind == "secret":
+                masked = _mask_secret(raw)
+                fields[name] = {"kind": kind, **masked, "default": default}
+                enabled = enabled or masked["has_value"]
+            elif kind == "secret_list":
+                items = raw if isinstance(raw, list) else []
+                masked = _mask_secret(items[0] if items else "")
+                fields[name] = {
+                    "kind": kind,
+                    "has_value": bool(items),
+                    "masked": masked["masked"],
+                    "count": len(items),
+                    "default": default,
+                }
+                enabled = enabled or bool(items)
+            else:
+                value = raw if raw not in (None, "") else default
+                fields[name] = {"kind": kind, "value": value, "default": default}
+        view[provider_id] = {"label": spec["label"], "enabled": enabled, "fields": fields}
+    return view
 
 
 def _provider_meta():
@@ -124,12 +268,13 @@ def get_runtime_config(request: Request):
     }
 
     materials = {}
-    for key in _MATERIALS_KEYS:
+    for key in _STOCK_MATERIAL_KEYS:
         raw = app_section.get(key) or []
         materials[key] = {
             "count": len(raw) if isinstance(raw, list) else 0,
             "masked": _mask_secret(raw[0] if isinstance(raw, list) and raw else "")["masked"],
         }
+    materials["video_source"] = str(app_section.get("video_source", "pexels") or "pexels")
 
     tts_section = {
         "siliconflow_api_key": _mask_secret(app_config.siliconflow.get("api_key")),
@@ -155,6 +300,7 @@ def get_runtime_config(request: Request):
                 },
             },
             "materials": materials,
+            "ai_video": _ai_video_view(app_section),
             "tts": tts_section,
             "cloned_voices": cloned_voices,
         },
@@ -174,7 +320,22 @@ class MaterialsUpdate(BaseModel):
     pexels_api_keys: str | None = None
     pixabay_api_keys: str | None = None
     coverr_api_keys: str | None = None
-    wavespeed_api_keys: str | None = None
+    # 默认素材源（写入 [app] video_source）。
+    video_source: str | None = None
+
+
+class AIVideoProviderUpdate(BaseModel):
+    # 只提交要改的字段；None = 不修改，空串 = 清除回退默认值。
+    # 整数字段留空时前端应省略或传 null，避免空串触发校验失败。
+    api_key: str | None = None
+    api_keys: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    video_endpoint: str | None = None
+    resolution: str | None = None
+    min_duration: int | None = None
+    max_duration: int | None = None
+    provider: str | None = None
 
 
 class TTSConfigUpdate(BaseModel):
@@ -185,6 +346,7 @@ class TTSConfigUpdate(BaseModel):
 class ConfigUpdateRequest(BaseModel):
     llm: LLMConfigUpdate | None = None
     materials: MaterialsUpdate | None = None
+    ai_video: dict[str, AIVideoProviderUpdate] | None = None
     tts: TTSConfigUpdate | None = None
 
 
@@ -329,12 +491,50 @@ def update_runtime_config(request: Request, body: ConfigUpdateRequest):
             updated.append(key)
 
     if body.materials is not None:
-        for key in _MATERIALS_KEYS:
+        for key in _STOCK_MATERIAL_KEYS:
             value = getattr(body.materials, key)
             if value is None:
                 continue
             update_config_nonblocking(app_section, key, _split_keys(value))
             updated.append(key)
+
+        # 默认素材源：空串 = 清除（回退代码默认），否则必须是已知来源。
+        video_source = body.materials.video_source
+        if video_source is not None:
+            if video_source == "":
+                delete_config_nonblocking(app_section, "video_source")
+            elif video_source not in _KNOWN_VIDEO_SOURCES:
+                raise HttpException(
+                    task_id=request_id,
+                    status_code=400,
+                    message=f"{request_id}: unknown video source '{video_source}'",
+                )
+            else:
+                update_config_nonblocking(app_section, "video_source", video_source)
+            updated.append("video_source")
+
+    if body.ai_video is not None:
+        for provider_id, payload in body.ai_video.items():
+            spec = _AI_VIDEO_PROVIDERS.get(provider_id)
+            if spec is None:
+                raise HttpException(
+                    task_id=request_id,
+                    status_code=400,
+                    message=f"{request_id}: unknown ai video provider '{provider_id}'",
+                )
+            for name, config_key, kind in spec["fields"]:
+                value = getattr(payload, name, None)
+                if value is None:
+                    continue
+                if kind == "secret_list":
+                    update_config_nonblocking(app_section, config_key, _split_keys(value))
+                elif kind == "int":
+                    update_config_nonblocking(app_section, config_key, int(value))
+                elif value == "":
+                    delete_config_nonblocking(app_section, config_key)
+                else:
+                    update_config_nonblocking(app_section, config_key, value.strip())
+                updated.append(config_key)
 
     if body.tts is not None:
         value = body.tts.siliconflow_api_key

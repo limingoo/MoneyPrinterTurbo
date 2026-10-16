@@ -8,8 +8,9 @@ import { SettingsPage } from './pages/SettingsPage'
 import { MaterialsPage } from './pages/MaterialsPage'
 
 function currentPage(): Page {
-  const hash = location.hash.replace(/^#\/?/, '')
-  return hash === 'tasks' || hash === 'settings' || hash === 'materials' ? hash : 'create'
+  // 只看第一段，允许设置页使用 #/settings/<tab> 这类子路由。
+  const root = location.hash.replace(/^#\/?/, '').split('/')[0]
+  return root === 'tasks' || root === 'settings' || root === 'materials' ? root : 'create'
 }
 
 export default function App() {
