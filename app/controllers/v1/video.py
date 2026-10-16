@@ -249,7 +249,11 @@ def create_task(
             "request_id": request_id,
             "params": body.model_dump(),
         }
-        sm.state.update_task(task_id)
+        # Persist the subject up front so the task list has something to show
+        # before the background storyboard replaces it with a generated
+        # `task_name`. Only the raw subject is needed here; it never carries
+        # secrets and the rest of `params` stays out of the state store.
+        sm.state.update_task(task_id, video_subject=body.video_subject or "")
         try:
             task_manager.add_task(
                 tm.start, task_id=task_id, params=body, stop_at=stop_at

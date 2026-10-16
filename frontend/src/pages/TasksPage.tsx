@@ -170,6 +170,15 @@ function fmtTime(ts?: number) {
   return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
+/**
+ * 任务标题：后端生成的短标题优先，其次是创建时落库的原始主题。
+ * 脚本阶段完成后后端会写入 task_name，早于那之前只能用可能很长的主题兜底。
+ */
+function taskTitle(task?: TaskStatus | null) {
+  if (!task) return ''
+  return task.task_name?.trim() || task.video_subject?.trim() || ''
+}
+
 export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
   const toast = useToast()
   const [tasks, setTasks] = useState<TaskStatus[]>([])
@@ -411,7 +420,7 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
                     <span className="min-w-0 flex-1">
                       <span className="flex items-center gap-2">
                         <span className="truncate text-sm font-medium text-ink">
-                          {task.params?.video_subject || '未命名任务'}
+                          {taskTitle(task) || '未命名任务'}
                         </span>
                         {stateBadge(task)}
                       </span>
@@ -598,7 +607,7 @@ export function TasksPage({ onGoCreate }: { onGoCreate: () => void }) {
         onClose={() => setDeleting(null)}
       >
         <p className="text-sm text-muted">
-          确定删除任务「{deleting?.params?.video_subject || deleting?.task_id}」吗？
+          确定删除任务「{taskTitle(deleting) || deleting?.task_id}」吗？
           该任务的所有生成文件都会被移除，操作不可恢复。
         </p>
         <div className="mt-5 flex justify-end gap-2">

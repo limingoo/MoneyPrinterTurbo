@@ -394,6 +394,26 @@ def generate_script(task_id, params):
     return video_script
 
 
+def _name_task(task_id, params, video_script):
+    """给任务起一个短标题，写进任务状态供列表展示。
+
+    标题失败一律吞掉：它是纯展示字段，不该让已经过了预检的任务在这里翻车。
+
+    用 patch_task 而不是 update_task：后者带 state/progress 默认值，只传
+    task_name 会把脚本阶段刚推进的进度清零。patch_task 是纯字段合并，也不会
+    在任务已被删除时把它重建出来。
+    """
+    try:
+        title = llm.generate_task_title(params.video_subject, video_script)
+    except Exception as exc:
+        logger.warning(f"skip task title for {task_id}: {exc}")
+        return
+
+    if not title:
+        return
+    sm.state.patch_task(task_id, task_name=title)
+
+
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
@@ -1672,6 +1692,13 @@ def _run_pipeline(
             else "failed to generate video script"
         )
         return _mark_task_failed(task_id, "script", error)
+
+    # 3. Name the task. This is display-only, so it must never fail the
+    # pipeline: the LLM can stall or return junk, and a missing title is
+    # strictly better than a failed render. It runs after the script so it
+    # costs no submission latency (task creation stays instant) and the
+    # prompt already has the full context.
+    _name_task(task_id, params, video_script)
 
     _mark_task_stage(task_id, STAGE_TERMS, 10)
 

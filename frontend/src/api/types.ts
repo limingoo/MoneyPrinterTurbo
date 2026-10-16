@@ -78,6 +78,8 @@ export interface TaskStatus {
   task_id: string
   state: number
   progress: number
+  /** 后端生成的短标题；脚本阶段完成后才有 */
+  task_name?: string
   stage?: string
   videos?: string[]
   combined_videos?: string[]
@@ -85,6 +87,8 @@ export interface TaskStatus {
   subtitle_path?: string
   failed_stage?: string
   error?: string
+  /** 后端创建任务时落库的原始主题，task_name 缺失时的兜底 */
+  video_subject?: string
   params?: VideoParams
   created_at?: number
 }

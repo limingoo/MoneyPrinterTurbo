@@ -173,7 +173,9 @@ def create_video_with_custom_audio(
             "request_id": request_id,
             "params": body.model_dump(),
         }
-        sm.state.update_task(task_id)
+        # Same reasoning as create_video: persist the subject so the task list
+        # can label the task until the background storyboard sets `task_name`.
+        sm.state.update_task(task_id, video_subject=body.video_subject or "")
         try:
             task_manager.add_task(tm.start, task_id=task_id, params=body, stop_at="video")
         except Exception:

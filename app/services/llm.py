@@ -1230,6 +1230,163 @@ def generate_social_metadata(
     return _fallback_social_metadata(video_subject, video_script, platform)
 
 
+# ---------------------------------------------------------------------------
+# 任务名（task name）
+# ---------------------------------------------------------------------------
+# 创作主题通常是一整段提示词，直接当列表标题既超长又难读，所以让模型把它压成
+# 一个短标题。标题是纯展示字段，因此解析要极度宽容，并且永远有确定性兜底。
+MAX_TASK_TITLE_LENGTH = 24
+_TASK_TITLE_MAX_RETRIES = 2
+
+_TITLE_WRAPPERS = "\"'“”‘’`*_《》「」『』【】[]()（）# \t"
+_TITLE_LABEL = re.compile(r"^(?:title|标题)\s*[:：]\s*", re.IGNORECASE)
+_TITLE_BULLET = re.compile(r"^(?:[-*+•]|\d+[.)、])\s*")
+# 提示词常见的祈使开头，作为标题没有信息量。它们可以叠加（"请帮我做一个…"），
+# 所以逐个剥而不是一次正则。
+_TITLE_POLITE_PREFIX = ("请", "帮我", "麻烦", "给我", "替我", "我想", "我要", "想要")
+_TITLE_TRAILING = " \t。．.！!？?，,、；;：:…~～-—"
+
+
+def build_task_title_prompt(video_subject: str, video_script: str = "") -> str:
+    return f"""
+# Role: Short-Video Title Writer
+
+## Goal
+Name this video so the creator can recognise it instantly in a task list.
+
+## Constraints
+1. Respond ONLY with the title as a single JSON string. No markdown, no code fences, no commentary.
+2. At most {MAX_TASK_TITLE_LENGTH} characters.
+3. Use the same language as the video subject and script.
+4. Describe what the video is actually about. No emoji, no hashtags, no clickbait, no marketing adjectives.
+5. Drop the instruction wrapper around the subject (for example "a video about ...") and keep the topic.
+6. No trailing punctuation and no surrounding quotes.
+
+## Output Example
+"三分钟看懂复利到底怎么滚起来"
+
+## Context
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+""".strip()
+
+
+def _clean_task_title(value) -> str:
+    """剥掉模型爱加的markdown 包裹、列表符号、"标题:"前缀和句末标点。"""
+
+    title = re.sub(r"\s+", " ", str(value or "")).strip()
+    # 前缀可能叠加（"1. **标题: xxx**"），循环到不再变化为止。
+    for _ in range(4):
+        stripped = _TITLE_LABEL.sub("", _TITLE_BULLET.sub("", title)).strip()
+        stripped = stripped.strip(_TITLE_WRAPPERS)
+        if stripped == title:
+            break
+        title = stripped
+    return title.rstrip(_TITLE_TRAILING)
+
+
+def _strip_polite_prefix(text: str) -> str:
+    for prefix in _TITLE_POLITE_PREFIX:
+        if text.startswith(prefix):
+            stripped = text[len(prefix):].lstrip()
+            # 剥完可能又暴露出下一个前缀（"请帮我"），所以继续往下走。
+            return _strip_polite_prefix(stripped) if stripped else stripped
+    return text
+
+
+def _parse_task_title(response: str) -> str:
+    text = _strip_code_fence(response or "").strip()
+    if not text:
+        raise ValueError("task title response is empty")
+
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        # 部分模型会在 JSON 外包一段说明文字或 markdown fence，这里提取第一个
+        # JSON 片段再试一次。
+        match = re.search(r"\{.*\}|\".*?\"", text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except Exception:
+                data = None
+
+    candidates = []
+    if isinstance(data, str):
+        candidates.append(data)
+    elif isinstance(data, dict):
+        candidates.append(str(data.get("title", "")))
+    else:
+        # 模型偶尔直接回一句纯文本而不是 JSON。标题是展示字段，宁可宽松收下，
+        # 也不要因为格式不标准就把整个任务带崩。
+        candidates.append(text.splitlines()[0] if text else "")
+
+    for candidate in candidates:
+        title = _clamp_text(_clean_task_title(candidate), MAX_TASK_TITLE_LENGTH)
+        if title:
+            return title
+    raise ValueError("task title response has no usable title")
+
+
+def _fallback_task_title(video_subject: str, video_script: str) -> str:
+    """LLM 不可用时的确定性兜底：取主题/脚本的第一个短句。"""
+
+    for source in (video_subject, video_script):
+        text = re.sub(r"\s+", " ", str(source or "")).strip()
+        if not text:
+            continue
+        first = re.split(r"(?<=[。！？!?；;])\s*|[.!?]\s+", text)[0].strip()
+        # 提示词常见的祈使开头和客套话作为标题没有信息量。
+        title = _clamp_text(
+            _clean_task_title(_strip_polite_prefix(first)), MAX_TASK_TITLE_LENGTH
+        )
+        if title:
+            return title
+    return ""
+
+
+def generate_task_title(video_subject: str, video_script: str = "") -> str:
+    """
+    为任务生成一个短标题，供任务列表展示。
+
+    创作主题往往是一整段提示词，直接展示会又长又难读，所以这里让模型基于主题
+    和脚本重新命名。返回空字符串表示模型和兜底规则都没能挤出可用文本，调用方
+    必须自行决定回退值——这个字段是纯装饰，绝不能让任务失败。
+    """
+
+    subject = _limit_social_text(
+        video_subject, MAX_SOCIAL_SUBJECT_LENGTH, "video_subject"
+    )
+    script = _limit_social_text(video_script, MAX_SOCIAL_SCRIPT_LENGTH, "video_script")
+    if not (subject or script):
+        return ""
+
+    prompt = build_task_title_prompt(subject, script)
+    logger.info("generating task title")
+
+    for i in range(_TASK_TITLE_MAX_RETRIES):
+        try:
+            response = _generate_response(prompt)
+            if isinstance(response, str) and response.startswith("Error: "):
+                logger.error(f"failed to generate task title: {response}")
+                break
+            title = _parse_task_title(response)
+            logger.success(f"completed task title: {title}")
+            return title
+        except Exception as e:
+            logger.warning(f"failed to generate task title: {str(e)}")
+
+        if i < _TASK_TITLE_MAX_RETRIES - 1:
+            logger.warning(f"failed to generate task title, trying again... {i + 1}")
+
+    logger.warning("falling back to heuristic task title")
+    return _fallback_task_title(subject, script)
+
+
 if __name__ == "__main__":
     video_subject = "生命的意义是什么"
     script = generate_script(
