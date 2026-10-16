@@ -1,6 +1,11 @@
 import ast
+import contextlib
 import copy
+import json
+import os
+import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 
 from redis.exceptions import ResponseError
@@ -8,6 +13,12 @@ from itertools import islice
 
 from app.config import config
 from app.models import const
+from app.utils import utils
+
+try:  # Windows 上没有 fcntl，退化为仅进程内加锁
+    import fcntl
+except ImportError:  # pragma: no cover - 平台差异
+    fcntl = None
 
 
 _PATCH_EXISTING_TASK_SCRIPT = """
@@ -116,6 +127,171 @@ class MemoryState(BaseState):
     def delete_task(self, task_id: str):
         with self._lock:
             self._tasks.pop(task_id, None)
+
+
+# File-backed state management
+class FileState(BaseState):
+    """
+    以磁盘文件持久化任务状态，替代不跨重启的 ``MemoryState``。
+
+    每个任务的状态写入 ``storage/tasks/<task_id>/state.json``，与任务产物同目录，
+    随任务目录一同删除。写入采用「临时文件 + 原子替换」，并进行进程内加锁和
+    （类 Unix 平台的）``flock`` 跨进程加锁，避免 API 与 WebUI 两个进程并发
+    读改写同一任务时互相覆盖。
+
+    ``created_at`` 在任务首次写入时补一个 Unix 秒时间戳，用于列表稳定排序
+    （新的在前），同时供前端展示创建时间。
+    """
+
+    _STATE_FILENAME = "state.json"
+    _LOCK_FILENAME = ".state.lock"
+
+    def __init__(self, root: str | None = None):
+        self._root = root or utils.storage_dir("tasks", create=True)
+        self._lock = threading.RLock()
+        self._lock_path = os.path.join(self._root, self._LOCK_FILENAME)
+
+    @staticmethod
+    def _is_safe_task_id(task_id: str) -> bool:
+        # 任务 ID 来自 URL 路径，必须阻止其逃逸出 storage/tasks 目录。
+        if not task_id or not isinstance(task_id, str):
+            return False
+        if task_id in (".", ".."):
+            return False
+        return "/" not in task_id and "\\" not in task_id and "\x00" not in task_id
+
+    def _task_file(self, task_id: str) -> str:
+        return os.path.join(self._root, task_id, self._STATE_FILENAME)
+
+    @contextlib.contextmanager
+    def _interprocess_lock(self):
+        if fcntl is None:
+            yield
+            return
+        os.makedirs(self._root, exist_ok=True)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _read(self, task_id: str):
+        if not self._is_safe_task_id(task_id):
+            return None
+        try:
+            with open(self._task_file(task_id), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except (ValueError, OSError):
+            # 半写入或损坏的文件不应让整个列表/查询失败。
+            return None
+        if not isinstance(data, dict) or data.get("task_id") != task_id:
+            return None
+        return data
+
+    def _write(self, task_id: str, data: dict):
+        task_dir = os.path.join(self._root, task_id)
+        os.makedirs(task_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=task_dir, prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                # default=str 兜底非 JSON 原生类型（如 Path），保证状态写入不中断流水线。
+                json.dump(data, handle, ensure_ascii=False, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, os.path.join(task_dir, self._STATE_FILENAME))
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _scan_task_ids(self) -> list[str]:
+        try:
+            entries = os.listdir(self._root)
+        except FileNotFoundError:
+            return []
+        records: list[tuple[int, str]] = []
+        for name in entries:
+            data = self._read(name)
+            if data is None:
+                continue
+            try:
+                created = int(data.get("created_at"))
+            except (TypeError, ValueError):
+                created = 0
+            records.append((created, name))
+        # 创建时间降序；同一秒内按 ID 兜底，保证分页顺序确定。
+        records.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [name for _, name in records]
+
+    def get_all_tasks(self, page: int, page_size: int):
+        start = (page - 1) * page_size
+        end = start + page_size
+        with self._lock:
+            task_ids = self._scan_task_ids()
+            page_ids = task_ids[start:end]
+        tasks = []
+        for task_id in page_ids:
+            task = self.get_task(task_id)
+            if task is not None:
+                tasks.append(task)
+        return tasks, len(task_ids)
+
+    def list_task_ids(self, scan_count: int = 100) -> list[str]:
+        with self._lock:
+            return self._scan_task_ids()
+
+    def update_task(
+        self,
+        task_id: str,
+        state: int = const.TASK_STATE_PROCESSING,
+        progress: int = 0,
+        **kwargs,
+    ):
+        progress = int(progress)
+        if progress > 100:
+            progress = 100
+        with self._lock, self._interprocess_lock():
+            existing = self._read(task_id) or {}
+            merged = {
+                **existing,
+                "task_id": task_id,
+                "state": state,
+                "progress": progress,
+                **copy.deepcopy(kwargs),
+            }
+            merged.setdefault("created_at", int(time.time()))
+            self._write(task_id, merged)
+
+    def get_task(self, task_id: str):
+        with self._lock:
+            task = self._read(task_id)
+        return copy.deepcopy(task) if task is not None else None
+
+    def patch_task(self, task_id: str, **kwargs) -> bool:
+        if not kwargs:
+            return False
+        with self._lock, self._interprocess_lock():
+            task = self._read(task_id)
+            if task is None:
+                return False
+            task.update(copy.deepcopy(kwargs))
+            self._write(task_id, task)
+            return True
+
+    def delete_task(self, task_id: str):
+        if not self._is_safe_task_id(task_id):
+            return
+        with self._lock, self._interprocess_lock():
+            try:
+                os.remove(self._task_file(task_id))
+            except (FileNotFoundError, NotADirectoryError):
+                pass
 
 
 # Redis state management
@@ -295,15 +471,19 @@ class RedisState(BaseState):
 
 # Global state
 _enable_redis = config.app.get("enable_redis", False)
+_enable_file_state = config.app.get("enable_file_state", True)
 _redis_host = config.app.get("redis_host", "localhost")
 _redis_port = config.app.get("redis_port", 6379)
 _redis_db = config.app.get("redis_db", 0)
 _redis_password = config.app.get("redis_password", None)
 
-state = (
-    RedisState(
+# 优先级：Redis > 文件持久化 > 纯内存。默认用文件持久化，使任务列表跨重启保留；
+# 仅在显式 enable_file_state=false 时回退到不持久化的 MemoryState。
+if _enable_redis:
+    state = RedisState(
         host=_redis_host, port=_redis_port, db=_redis_db, password=_redis_password
     )
-    if _enable_redis
-    else MemoryState()
-)
+elif _enable_file_state:
+    state = FileState()
+else:
+    state = MemoryState()

@@ -513,11 +513,18 @@ material_directory = ""
 
 # Optional Redis-backed task state. Keep Redis private to this application;
 # untrusted writers must not be able to modify serialized task records.
+# When disabled, task state is persisted to storage/tasks/<task_id>/state.json
+# (see enable_file_state) so the task list survives restarts.
 enable_redis = false
 redis_host = "localhost"
 redis_port = 6379
 redis_db = 0
 redis_password = ""
+
+# File-backed task state used when enable_redis = false. Enabled by default so
+# the task list survives process restarts and container rebuilds. Set to false
+# only if you explicitly want non-persistent in-memory state.
+enable_file_state = true
 
 # Maximum number of concurrent and queued API video-generation tasks.
 max_concurrent_tasks = 5
