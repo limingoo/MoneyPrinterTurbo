@@ -23,12 +23,17 @@ RUN set -u; \
     write_debian_sources() { \
         main_url="$1"; \
         security_url="$2"; \
-        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\ndeb %s bullseye-security main\n' \
-            "$main_url" "$main_url" "$security_url" > /etc/apt/sources.list; \
+        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\n' \
+            "$main_url" "$main_url" > /etc/apt/sources.list; \
         rm -rf /var/lib/apt/lists/*; \
     }; \
     install_system_dependencies() { \
         apt-get update && \
+        apt-get install -y --allow-downgrades --no-install-recommends \
+            perl-base=5.32.1-4+deb11u3 \
+            libperl5.32=5.32.1-4+deb11u3 \
+            perl-modules-5.32=5.32.1-4+deb11u3 \
+            perl=5.32.1-4+deb11u3 && \
         apt-get install -y --no-install-recommends git ffmpeg; \
     }; \
     retry_system_dependencies() { \
